@@ -1323,6 +1323,82 @@ test "spans added directly merge, wrap and filter as the original's" {
     }
 }
 
+test "the distance field matches on grids broken at every place of a run" {
+    // Flat floors, a field of them in 16-column runs where every column
+    // holds one span joined to its neighbours, broken at random by holes,
+    // a second floor above, columns with only that floor (whose
+    // neighbours join index 1), steps too high to climb and other areas,
+    // at densities from none to most columns; and fields narrower,
+    // shorter and a column or two wider than a run.
+    var prng: std.Random.DefaultPrng = .init(17);
+    const random = prng.random();
+    var logs = try Logs.init();
+    defer logs.deinit();
+    const ctx = logs.port();
+    const sizes = [_][2]i32{
+        .{ 1, 1 },   .{ 17, 3 },  .{ 18, 3 },   .{ 19, 4 },  .{ 33, 5 },
+        .{ 34, 6 },  .{ 35, 3 },  .{ 50, 2 },   .{ 51, 30 }, .{ 66, 40 },
+        .{ 100, 1 }, .{ 3, 100 }, .{ 130, 70 },
+    };
+    const densities = [_]u32{ 0, 1, 10, 100, 400, 1000 };
+    for (sizes) |size| for (densities) |per_thousand| for (0..2) |_| {
+        const w = size[0];
+        const h = size[1];
+        const bmin: [3]f32 = .{ 0, 0, 0 };
+        const bmax: [3]f32 = .{ @floatFromInt(w), 100, @floatFromInt(h) };
+        var hf = try recast.Heightfield.init(gpa, w, h, &bmin, &bmax, 1, 0.1);
+        defer hf.deinit(gpa);
+        const original_hf = upstream.shim_hf_create(logs.original, w, h, &bmin, &bmax, 1, 0.1) orelse
+            return error.OutOfMemory;
+        defer upstream.shim_hf_free(original_hf);
+        var z: i32 = 0;
+        while (z < h) : (z += 1) {
+            var x: i32 = 0;
+            while (x < w) : (x += 1) {
+                var floors: [2]?u16 = .{ 10, null };
+                var area: u8 = recast.walkable_area;
+                if (random.uintLessThan(u32, 1000) < per_thousand) {
+                    switch (random.uintLessThan(u32, 5)) {
+                        0 => floors = .{ null, null },
+                        1 => floors[1] = 200,
+                        2 => floors = .{ null, 200 },
+                        3 => floors[0] = 30,
+                        else => area = 1 + random.uintLessThan(u8, 2),
+                    }
+                }
+                for (floors) |floor| {
+                    const top = floor orelse continue;
+                    const ok = recast.addSpan(ctx, gpa, &hf, x, z, top - 10, top, area, 1);
+                    const original_ok = upstream.shim_add_span(
+                        logs.original,
+                        original_hf,
+                        x,
+                        z,
+                        top - 10,
+                        top,
+                        area,
+                        1,
+                    );
+                    _ = try sameOutcome(&logs, "add span", succeeded(ok), original_ok != 0);
+                }
+            }
+        }
+        const height = 20;
+        const climb = 5;
+        var chf = try recast.buildCompactHeightfield(ctx, gpa, height, climb, &hf);
+        defer chf.deinit(gpa);
+        const original_chf = upstream.shim_chf_build(logs.original, height, climb, original_hf) orelse
+            return error.TestUnexpectedResult;
+        defer upstream.shim_chf_free(original_chf);
+        try logs.expectSame("compact");
+        try expectSameDump("compact", &chf, original_chf);
+        try recast.buildDistanceField(ctx, gpa, &chf);
+        try testing.expect(upstream.shim_distance_field(logs.original, original_chf) != 0);
+        try logs.expectSame("distance");
+        try expectSameDump("distance", &chf, original_chf);
+    };
+}
+
 test "a column of more than 63 floors logs too many layers as the original" {
     var logs = try Logs.init();
     defer logs.deinit();

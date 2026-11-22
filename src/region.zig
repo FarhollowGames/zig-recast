@@ -36,26 +36,6 @@ const LevelStackEntry = struct {
     index: i32,
 };
 
-/// A compact heightfield's columns, spans and areas, held by value: read
-/// through the heightfield's pointer, they would be loaded again after every
-/// store to a span's distance.
-const FieldView = struct {
-    cells: []const recast.CompactCell,
-    spans: []const recast.CompactSpan,
-    areas: []const u8,
-    width: i32,
-
-    fn of(chf: *const CompactHeightfield) FieldView {
-        return .{ .cells = chf.cells, .spans = chf.spans, .areas = chf.areas, .width = chf.width };
-    }
-
-    /// The index of span `con` of column (x, y).
-    fn at(f: FieldView, x: i32, y: i32, con: i32) usize {
-        const first: usize = f.cells[@intCast(x + y * f.width)].index;
-        return first + @as(usize, @intCast(con));
-    }
-};
-
 /// The index of span `con` of column (x, y): how a connection names a
 /// neighbour.
 fn spanIndexAt(chf: *const CompactHeightfield, x: i32, y: i32, con: i32) usize {
@@ -63,190 +43,427 @@ fn spanIndexAt(chf: *const CompactHeightfield, x: i32, y: i32, con: i32) usize {
     return first + @as(usize, @intCast(con));
 }
 
-/// Each span's distance to the nearest border or area change into `src`, 2
-/// per step along an axis and 3 per diagonal step; returns the largest.
-fn calculateDistanceField(chf: *const CompactHeightfield, src: []u16) u16 {
-    const f: FieldView = .of(chf);
-    const w = chf.width;
-    const h = chf.height;
+/// A compact heightfield's columns, spans and areas for the distance field
+/// and its blur, held by value: read through the heightfield's pointer,
+/// they would be loaded again after every store to a span's distance.
+/// Columns are named by their index in `cells`, x + y * width, so the
+/// neighbour column in a direction is a fixed step from it.
+const DistanceView = struct {
+    cells: [*]const recast.CompactCell,
+    spans: [*]const recast.CompactSpan,
+    areas: [*]const u8,
+    width: usize,
+    /// The step from a column to its neighbour in each direction: west,
+    /// north (+y), east, south (-y).
+    step: [4]isize,
 
-    // Init distance and points.
-    @memset(src, 0xffff);
-
-    // Mark boundary cells.
-    var y: i32 = 0;
-    while (y < h) : (y += 1) {
-        var x: i32 = 0;
-        while (x < w) : (x += 1) {
-            const c = f.cells[@intCast(x + y * w)];
-            const first: usize = c.index;
-            for (first..first + c.count) |i| {
-                const s = f.spans[i];
-                const area = f.areas[i];
-                var nc: i32 = 0;
-                inline for (directions) |dir| {
-                    if (getCon(s, dir) != not_connected) {
-                        const ax = x + getDirOffsetX(dir);
-                        const ay = y + getDirOffsetY(dir);
-                        const ai = f.at(ax, ay, getCon(s, dir));
-                        if (area == f.areas[ai]) nc += 1;
-                    }
-                }
-                if (nc != 4) src[i] = 0;
-            }
-        }
+    fn of(chf: *const CompactHeightfield) DistanceView {
+        return .{
+            .cells = chf.cells.ptr,
+            .spans = chf.spans.ptr,
+            .areas = chf.areas.ptr,
+            .width = @intCast(@max(chf.width, 0)),
+            .step = .{ -1, chf.width, 1, -chf.width },
+        };
     }
 
-    // Pass 1
-    y = 0;
-    while (y < h) : (y += 1) {
-        var x: i32 = 0;
-        while (x < w) : (x += 1) {
-            const c = f.cells[@intCast(x + y * w)];
-            const first: usize = c.index;
-            for (first..first + c.count) |i| {
-                const s = f.spans[i];
-                // A neighbour is never the span itself, so its distance
-                // stays in a register until the span is done.
-                var d = src[i];
-                if (getCon(s, 0) != not_connected) {
-                    // (-1,0)
-                    const ax = x + getDirOffsetX(0);
-                    const ay = y + getDirOffsetY(0);
-                    const ai = f.at(ax, ay, getCon(s, 0));
-                    const a_span = f.spans[ai];
-                    if (@as(i32, src[ai]) + 2 < d) d = src[ai] + 2;
-
-                    // (-1,-1)
-                    if (getCon(a_span, 3) != not_connected) {
-                        const aax = ax + getDirOffsetX(3);
-                        const aay = ay + getDirOffsetY(3);
-                        const aai = f.at(aax, aay, getCon(a_span, 3));
-                        if (@as(i32, src[aai]) + 3 < d) d = src[aai] + 3;
-                    }
-                }
-                if (getCon(s, 3) != not_connected) {
-                    // (0,-1)
-                    const ax = x + getDirOffsetX(3);
-                    const ay = y + getDirOffsetY(3);
-                    const ai = f.at(ax, ay, getCon(s, 3));
-                    const a_span = f.spans[ai];
-                    if (@as(i32, src[ai]) + 2 < d) d = src[ai] + 2;
-
-                    // (1,-1)
-                    if (getCon(a_span, 2) != not_connected) {
-                        const aax = ax + getDirOffsetX(2);
-                        const aay = ay + getDirOffsetY(2);
-                        const aai = f.at(aax, aay, getCon(a_span, 2));
-                        if (@as(i32, src[aai]) + 3 < d) d = src[aai] + 3;
-                    }
-                }
-                src[i] = d;
-            }
-        }
+    /// The column `dir` of column `col`.
+    inline fn next(v: DistanceView, col: usize, comptime dir: u2) usize {
+        return @intCast(@as(isize, @intCast(col)) + v.step[dir]);
     }
 
-    // Pass 2
-    y = h - 1;
-    while (y >= 0) : (y -= 1) {
-        var x: i32 = w - 1;
-        while (x >= 0) : (x -= 1) {
-            const c = f.cells[@intCast(x + y * w)];
-            const first: usize = c.index;
-            for (first..first + c.count) |i| {
-                const s = f.spans[i];
-                var d = src[i];
-                if (getCon(s, 2) != not_connected) {
-                    // (1,0)
-                    const ax = x + getDirOffsetX(2);
-                    const ay = y + getDirOffsetY(2);
-                    const ai = f.at(ax, ay, getCon(s, 2));
-                    const a_span = f.spans[ai];
-                    if (@as(i32, src[ai]) + 2 < d) d = src[ai] + 2;
-
-                    // (1,1)
-                    if (getCon(a_span, 1) != not_connected) {
-                        const aax = ax + getDirOffsetX(1);
-                        const aay = ay + getDirOffsetY(1);
-                        const aai = f.at(aax, aay, getCon(a_span, 1));
-                        if (@as(i32, src[aai]) + 3 < d) d = src[aai] + 3;
-                    }
-                }
-                if (getCon(s, 1) != not_connected) {
-                    // (0,1)
-                    const ax = x + getDirOffsetX(1);
-                    const ay = y + getDirOffsetY(1);
-                    const ai = f.at(ax, ay, getCon(s, 1));
-                    const a_span = f.spans[ai];
-                    if (@as(i32, src[ai]) + 2 < d) d = src[ai] + 2;
-
-                    // (-1,1)
-                    if (getCon(a_span, 0) != not_connected) {
-                        const aax = ax + getDirOffsetX(0);
-                        const aay = ay + getDirOffsetY(0);
-                        const aai = f.at(aax, aay, getCon(a_span, 0));
-                        if (@as(i32, src[aai]) + 3 < d) d = src[aai] + 3;
-                    }
-                }
-                src[i] = d;
-            }
-        }
+    /// The index of the span that connection `con` of a span in column
+    /// `col` names, for a connected `con`.
+    inline fn at(v: DistanceView, col: usize, con: u32) usize {
+        return @as(usize, v.cells[col].index) + con;
     }
+};
 
-    var max_dist: u16 = 0;
-    for (src) |d| max_dist = @max(d, max_dist);
-    return max_dist;
+/// Connection `dir` of a span's packed connections.
+inline fn conOf(con: u32, comptime dir: u2) u32 {
+    return (con >> (@as(u5, dir) * 6)) & 0x3f;
 }
 
-/// Blurs `src` into `dst`: each span farther than `thr` * 2 from the border
-/// gets the rounded mean of itself and its 8 neighbours, a missing neighbour
-/// counting as the span itself.
-fn boxBlur(chf: *const CompactHeightfield, thr: i32, src: []const u16, dst: []u16) void {
-    const f: FieldView = .of(chf);
-    const w = chf.width;
-    const h = chf.height;
-    const threshold = thr * 2;
+/// Whether any of the four connections packed in `con` is `not_connected`,
+/// all six of its bits set.
+inline fn anyNotConnected(con: u32) bool {
+    const t = con & (con >> 1) & (con >> 2) & (con >> 3) & (con >> 4) & (con >> 5);
+    return t & 0x041041 != 0;
+}
 
-    var y: i32 = 0;
-    while (y < h) : (y += 1) {
-        var x: i32 = 0;
-        while (x < w) : (x += 1) {
-            const c = f.cells[@intCast(x + y * w)];
-            const first: usize = c.index;
-            for (first..first + c.count) |i| {
-                const s = f.spans[i];
-                const cd = src[i];
-                if (cd <= threshold) {
-                    dst[i] = cd;
-                    continue;
-                }
+comptime {
+    assert(not_connected == 0x3f);
+}
 
-                var d: i32 = cd;
-                inline for (directions) |dir| {
-                    if (getCon(s, dir) != not_connected) {
-                        const ax = x + getDirOffsetX(dir);
-                        const ay = y + getDirOffsetY(dir);
-                        const ai = f.at(ax, ay, getCon(s, dir));
-                        d += src[ai];
+/// 0 for a span on the border, one with a neighbour missing or of another
+/// area, and 0xffff for any other: the start of its distance.
+inline fn borderDistance(v: DistanceView, col: usize, i: usize) u32 {
+    const con: u32 = v.spans[i].con;
+    if (anyNotConnected(con)) return 0;
+    const area = v.areas[i];
+    const a0 = v.areas[v.at(v.next(col, 0), conOf(con, 0))];
+    const a1 = v.areas[v.at(v.next(col, 1), conOf(con, 1))];
+    const a2 = v.areas[v.at(v.next(col, 2), conOf(con, 2))];
+    const a3 = v.areas[v.at(v.next(col, 3), conOf(con, 3))];
+    return if ((a0 ^ area) | (a1 ^ area) | (a2 ^ area) | (a3 ^ area) != 0) 0 else 0xffff;
+}
 
-                        const a_span = f.spans[ai];
-                        const dir2 = dir +% 1;
-                        if (getCon(a_span, dir2) != not_connected) {
-                            const ax2 = ax + getDirOffsetX(dir2);
-                            const ay2 = ay + getDirOffsetY(dir2);
-                            const ai2 = f.at(ax2, ay2, getCon(a_span, dir2));
-                            d += src[ai2];
-                        } else {
-                            d += cd;
-                        }
-                    } else {
-                        d += @as(i32, cd) * 2;
-                    }
-                }
-                dst[i] = @intCast(@divTrunc(d + 5, 9));
-            }
+/// The least of `d` and the distances of a span's neighbour in direction
+/// `dir` plus 2 and of that neighbour's neighbour in direction `dir2` plus
+/// 3, the diagonal; the span's connections are `con`, its column `col`.
+inline fn sweepStep(
+    v: DistanceView,
+    dist: [*]const u16,
+    col: usize,
+    con: u32,
+    d: u32,
+    comptime dir: u2,
+    comptime dir2: u2,
+) u32 {
+    var m = d;
+    if (conOf(con, dir) != not_connected) {
+        const a_col = v.next(col, dir);
+        const ai = v.at(a_col, conOf(con, dir));
+        m = @min(m, @as(u32, dist[ai]) + 2);
+        const a_con: u32 = v.spans[ai].con;
+        if (conOf(a_con, dir2) != not_connected) {
+            const aai = v.at(v.next(a_col, dir2), conOf(a_con, dir2));
+            m = @min(m, @as(u32, dist[aai]) + 3);
         }
     }
+    return m;
+}
+
+/// The blur of span `i` of column `col`: the rounded mean of its distance
+/// and its 8 neighbours', a missing neighbour counting as the span itself,
+/// where the span is farther than `blur_threshold` from the border.
+inline fn blurSpan(v: DistanceView, dist: [*]const u16, col: usize, i: usize) u16 {
+    const cd: u32 = dist[i];
+    if (cd <= blur_threshold) return @intCast(cd);
+    const con: u32 = v.spans[i].con;
+    var d: u32 = cd;
+    inline for (directions) |dir| {
+        if (conOf(con, dir) != not_connected) {
+            const a_col = v.next(col, dir);
+            const ai = v.at(a_col, conOf(con, dir));
+            d += dist[ai];
+
+            const dir2 = dir +% 1;
+            const a_con: u32 = v.spans[ai].con;
+            if (conOf(a_con, dir2) != not_connected) {
+                d += dist[v.at(v.next(a_col, dir2), conOf(a_con, dir2))];
+            } else {
+                d += cd;
+            }
+        } else {
+            d += cd * 2;
+        }
+    }
+    return @intCast((d + 5) / 9);
+}
+
+/// The original blurs with a threshold of 1, doubled: spans at most this
+/// far from the border keep their distance.
+const blur_threshold = 2;
+
+/// Columns a run takes: 16 lanes of 32 bits, one AVX-512 register.
+const run_len = 16;
+const RunU32 = @Vector(run_len, u32);
+const RunU16 = @Vector(run_len, u16);
+
+/// A run of `run_len` columns in a row, from column `col`, whose columns
+/// and the columns around them, from one before it to one after it in the
+/// rows below, at and above it, each hold one span, connected to the span
+/// of the column next to it on every side, and each row's spans follow one
+/// another. There every neighbour of a span is the span of the
+/// neighbouring column, so a row's distances are a row of a grid, and the
+/// first is that of the span `below`, `at` or `above`.
+const Run = struct {
+    below: usize,
+    at: usize,
+    above: usize,
+
+    /// The run from column `col`, or null where its columns are not as
+    /// `Run` needs. `col` must be at least a row and a column from every
+    /// edge of the field, `run_len` columns and one more from the east one.
+    fn of(v: DistanceView, col: usize) ?Run {
+        const below = rowRun(v, col - v.width) orelse return null;
+        const at = rowRun(v, col) orelse return null;
+        const above = rowRun(v, col + v.width) orelse return null;
+        return .{ .below = below, .at = at, .above = above };
+    }
+
+    /// The span of column `col` if columns `col` - 1 to `col` + `run_len`
+    /// of one row each hold one span, with connections of index 0 on every
+    /// side, at consecutive indices; null otherwise.
+    fn rowRun(v: DistanceView, col: usize) ?usize {
+        const Cells = @Vector(run_len, u32);
+        const words: [*]const u32 = @ptrCast(v.cells);
+        const first = words[col - 1];
+        // One span, and an index that the run's last does not carry past
+        // the 24 bits of `index` into `count`.
+        if (first >> 24 != 1 or (first & 0xffffff) + run_len + 1 > 0xffffff) return null;
+        const step = std.simd.iota(u32, run_len);
+        const lo: Cells = words[col - 1 ..][0..run_len].*;
+        const hi: Cells = words[col + 1 ..][0..run_len].*;
+        const want: Cells = @as(Cells, @splat(first)) + step;
+        if (@reduce(.Or, lo != want) or @reduce(.Or, hi != want + @as(Cells, @splat(2)))) return null;
+        // Every connection 0: all 24 bits of `con` clear.
+        const span_first: usize = first & 0xffffff;
+        const Words = @Vector(run_len, u64);
+        const spans: [*]const u64 = @ptrCast(v.spans);
+        const con_mask: Words = @splat(@as(u64, 0xffffff) << 32);
+        const s_lo: Words = spans[span_first..][0..run_len].*;
+        const s_hi: Words = spans[span_first + 2 ..][0..run_len].*;
+        if (@reduce(.Or, (s_lo | s_hi) & con_mask) != 0) return null;
+        return span_first + 1;
+    }
+};
+
+comptime {
+    // `Run.rowRun` reads the cells and spans as words.
+    assert(@bitSizeOf(recast.CompactCell) == 32 and @bitOffsetOf(recast.CompactCell, "count") == 24);
+    assert(@bitSizeOf(recast.CompactSpan) == 64 and @bitOffsetOf(recast.CompactSpan, "con") == 32);
+}
+
+/// The `run_len` values of `values` from `i`, widened.
+inline fn load16(values: [*]const u16, i: usize) RunU32 {
+    const narrow: RunU16 = values[i..][0..run_len].*;
+    return narrow;
+}
+
+/// Each lane the least of itself and the lanes before it (`up`) or after
+/// it (not `up`), in log2(`run_len`) steps.
+inline fn scanMin(x: RunU32, comptime up: bool) RunU32 {
+    var r = x;
+    const fill: RunU32 = @splat(std.math.maxInt(u32));
+    comptime var shift = 1;
+    inline while (shift < run_len) : (shift *= 2) {
+        const mask = comptime blk: {
+            var m: [run_len]i32 = undefined;
+            for (&m, 0..) |*e, k| {
+                const from: i32 = if (up) @as(i32, k) - shift else @as(i32, k) + shift;
+                e.* = if (from >= 0 and from < run_len) from else -1;
+            }
+            break :blk m;
+        };
+        r = @min(r, @shuffle(u32, r, fill, mask));
+    }
+    return r;
+}
+
+/// The mark and the sweep up over a run: each span's distance is the least
+/// of its mark and of its west neighbour's plus 2, south-west's plus 3,
+/// south's plus 2 and south-east's plus 3, and its west neighbour's is
+/// the one just found. With `e` the least of the others, d[k] = min(e[k],
+/// d[k-1] + 2) is the least over j <= k of e[j] + 2 (k - j), and over the
+/// distance before the run plus 2 (k + 1), a scan.
+inline fn sweepUpRun(v: DistanceView, dist: [*]u16, run: Run) void {
+    const Areas = @Vector(run_len, u8);
+    const area: Areas = v.areas[run.at..][0..run_len].*;
+    const west: Areas = v.areas[run.at - 1 ..][0..run_len].*;
+    const east: Areas = v.areas[run.at + 1 ..][0..run_len].*;
+    const north: Areas = v.areas[run.above..][0..run_len].*;
+    const south: Areas = v.areas[run.below..][0..run_len].*;
+    const same = (area == west) & (area == east) & (area == north) & (area == south);
+    const mark: RunU32 = @select(u32, same, @as(RunU32, @splat(0xffff)), @as(RunU32, @splat(0)));
+
+    const two: RunU32 = @splat(2);
+    const three: RunU32 = @splat(3);
+    var e = @min(mark, load16(dist, run.below) + two);
+    e = @min(e, load16(dist, run.below - 1) + three);
+    e = @min(e, load16(dist, run.below + 1) + three);
+
+    const k = std.simd.iota(u32, run_len);
+    const lift = (@as(RunU32, @splat(run_len - 1)) - k) * two;
+    const before: u32 = dist[run.at - 1];
+    const least = @min(scanMin(e + lift, true), @as(RunU32, @splat(before + 2 * run_len)));
+    // At most 0xffff, as the mark is.
+    dist[run.at..][0..run_len].* = @as(RunU16, @intCast(least - lift));
+}
+
+/// The sweep down over a run, as `sweepUpRun` without the mark, from the
+/// east: d[k] = min(e[k], d[k+1] + 2).
+inline fn sweepDownRun(dist: [*]u16, run: Run) void {
+    const two: RunU32 = @splat(2);
+    const three: RunU32 = @splat(3);
+    var e = @min(load16(dist, run.at), load16(dist, run.above) + two);
+    e = @min(e, load16(dist, run.above - 1) + three);
+    e = @min(e, load16(dist, run.above + 1) + three);
+
+    const lift = std.simd.iota(u32, run_len) * two;
+    const after: u32 = dist[run.at + run_len];
+    const least = @min(scanMin(e + lift, false), @as(RunU32, @splat(after + 2 * run_len)));
+    dist[run.at..][0..run_len].* = @as(RunU16, @intCast(least - lift));
+}
+
+/// The blur over a run: every span has all eight neighbours.
+inline fn blurRun(src: [*]const u16, dst: [*]u16, run: Run) void {
+    const cd = load16(src, run.at);
+    var d = cd + load16(src, run.at - 1) + load16(src, run.at + 1);
+    d += load16(src, run.above - 1) + load16(src, run.above) + load16(src, run.above + 1);
+    d += load16(src, run.below - 1) + load16(src, run.below) + load16(src, run.below + 1);
+    const mean = (d + @as(RunU32, @splat(5))) / @as(RunU32, @splat(9));
+    const keep = cd <= @as(RunU32, @splat(blur_threshold));
+    dst[run.at..][0..run_len].* = @as(RunU16, @intCast(@select(u32, keep, cd, mean)));
+}
+
+/// Where a row's runs start and end: from column 1 of the row, as many
+/// whole runs as leave a column after them. Rows 0 and h - 1 have none.
+const RowRuns = struct {
+    first: usize,
+    end: usize,
+
+    fn of(w: usize, h: usize, y: usize) RowRuns {
+        const row = y * w;
+        if (y == 0 or y + 1 >= h or w < run_len + 2) return .{ .first = row, .end = row };
+        const runs = (w - 2) / run_len;
+        return .{ .first = row + 1, .end = row + 1 + runs * run_len };
+    }
+};
+
+/// Marks and sweeps up the spans of column `col`.
+inline fn sweepUpColumn(v: DistanceView, dist: [*]u16, col: usize) void {
+    const c = v.cells[col];
+    const first: usize = c.index;
+    for (first..first + c.count) |i| {
+        const con: u32 = v.spans[i].con;
+        var d = borderDistance(v, col, i);
+        // (0,-1) and (1,-1), (-1,0) and (-1,-1).
+        d = sweepStep(v, dist, col, con, d, 3, 2);
+        d = sweepStep(v, dist, col, con, d, 0, 3);
+        // At most 0xffff, as it started at most that.
+        dist[i] = @intCast(d);
+    }
+}
+
+/// Sweeps down the spans of column `col`.
+inline fn sweepDownColumn(v: DistanceView, dist: [*]u16, col: usize) void {
+    const c = v.cells[col];
+    const first: usize = c.index;
+    for (first..first + c.count) |i| {
+        const con: u32 = v.spans[i].con;
+        var d: u32 = dist[i];
+        // (0,1) and (-1,1), (1,0) and (1,1).
+        d = sweepStep(v, dist, col, con, d, 1, 0);
+        d = sweepStep(v, dist, col, con, d, 2, 1);
+        dist[i] = @intCast(d);
+    }
+}
+
+/// Blurs the spans of column `col`.
+inline fn blurColumn(v: DistanceView, src: [*]const u16, dst: [*]u16, col: usize) void {
+    const c = v.cells[col];
+    const first: usize = c.index;
+    for (first..first + c.count) |i| dst[i] = blurSpan(v, src, col, i);
+}
+
+/// Blurs row `y` of `src` into `dst`.
+fn blurRow(v: DistanceView, src: [*]const u16, dst: [*]u16, h: usize, y: usize) void {
+    const w = v.width;
+    const runs: RowRuns = .of(w, h, y);
+    for (y * w..runs.first) |col| blurColumn(v, src, dst, col);
+    var col = runs.first;
+    while (col < runs.end) : (col += run_len) {
+        if (Run.of(v, col)) |run| {
+            blurRun(src, dst, run);
+        } else {
+            for (col..col + run_len) |c| blurColumn(v, src, dst, c);
+        }
+    }
+    for (runs.end..y * w + w) |c| blurColumn(v, src, dst, c);
+}
+
+/// Each span's distance to the nearest border or area change into `src`, 2
+/// per step along an axis and 3 per diagonal step, and that blurred into
+/// `dst` (see `blurSpan`); returns the largest distance before the blur.
+/// Every span in no column keeps its distance of 0xffff in `src`, and in
+/// `dst` what it held.
+///
+/// The steps are the original's: mark the border spans 0 and the others
+/// 0xffff; sweep the rows up, each west to east, taking each span's
+/// distance as the least of its own and of its west, south-west, south and
+/// south-east neighbours' plus 2 or 3; sweep the rows down, each east to
+/// west, the same with the other four neighbours; then blur. The original
+/// goes over the whole field for each. Here a span is marked just before
+/// the first sweep reaches it, as its mark needs only areas, and a row is
+/// blurred as soon as the second sweep has finished the rows on both sides
+/// of it, so the field is read twice, not four times, and the blur finds
+/// its rows in the cache. Every step reads only distances that the
+/// original's same step reads, after the same steps have written them, so
+/// every distance comes out as the original's.
+///
+/// Where a run of columns is a grid (see `Run`), its spans are done
+/// `run_len` at a time, each sweep as a scan along the row.
+fn distanceField(chf: *const CompactHeightfield, src: []u16, dst: []u16) u16 {
+    @memset(src, 0xffff);
+    if (chf.width <= 0 or chf.height <= 0) return maxOf(src);
+
+    const v: DistanceView = .of(chf);
+    const dist = src.ptr;
+    const w: usize = @intCast(chf.width);
+    const h: usize = @intCast(chf.height);
+
+    // Mark and sweep up, rows up, each west to east.
+    for (0..h) |y| {
+        const runs: RowRuns = .of(w, h, y);
+        for (y * w..runs.first) |col| sweepUpColumn(v, dist, col);
+        var col = runs.first;
+        while (col < runs.end) : (col += run_len) {
+            if (Run.of(v, col)) |run| {
+                sweepUpRun(v, dist, run);
+            } else {
+                for (col..col + run_len) |c| sweepUpColumn(v, dist, c);
+            }
+        }
+        for (runs.end..y * w + w) |c| sweepUpColumn(v, dist, c);
+    }
+
+    // Sweep down, rows down, each east to west, and blur each row once the
+    // rows on both sides of it are done.
+    var y = h;
+    while (y > 0) {
+        y -= 1;
+        const runs: RowRuns = .of(w, h, y);
+        var col = y * w + w;
+        while (col > runs.end) {
+            col -= 1;
+            sweepDownColumn(v, dist, col);
+        }
+        while (col > runs.first) {
+            col -= run_len;
+            if (Run.of(v, col)) |run| {
+                sweepDownRun(dist, run);
+            } else {
+                var c = col + run_len;
+                while (c > col) {
+                    c -= 1;
+                    sweepDownColumn(v, dist, c);
+                }
+            }
+        }
+        while (col > y * w) {
+            col -= 1;
+            sweepDownColumn(v, dist, col);
+        }
+        if (y + 1 < h) blurRow(v, dist, dst.ptr, h, y + 1);
+    }
+    blurRow(v, dist, dst.ptr, h, 0);
+    return maxOf(src);
+}
+
+/// The largest of `values`, or 0 for none.
+fn maxOf(values: []const u16) u16 {
+    const lanes = std.simd.suggestVectorLength(u16) orelse 1;
+    const V = @Vector(lanes, u16);
+    var acc: V = @splat(0);
+    var i: usize = 0;
+    while (i + lanes <= values.len) : (i += lanes) {
+        acc = @max(acc, @as(V, values[i..][0..lanes].*));
+    }
+    var max_dist: u16 = @reduce(.Max, acc);
+    for (values[i..]) |d| max_dist = @max(d, max_dist);
+    return max_dist;
 }
 
 /// Floods region `r` from span `i` of column (x, y) over the connected spans
@@ -1158,6 +1375,11 @@ fn mergeAndFilterLayerRegions(
 /// Builds `chf.dist`, each span's distance to the nearest border or area
 /// change, blurred, and `chf.max_distance`, the largest before the blur.
 /// `buildRegions` needs it. Replaces an existing distance field.
+///
+/// The timers start and stop in the original's order, but the blur is done
+/// in the same passes as the distances, so its time falls within
+/// `build_distancefield_dist`, and `build_distancefield_blur` times only
+/// storing the result.
 pub fn buildDistanceField(
     ctx: Context,
     gpa: Allocator,
@@ -1186,15 +1408,13 @@ pub fn buildDistanceField(
         ctx.startTimer(.build_distancefield_dist);
         defer ctx.stopTimer(.build_distancefield_dist);
 
-        chf.max_distance = calculateDistanceField(chf, src);
+        // And the blur; see `distanceField`.
+        chf.max_distance = distanceField(chf, src, dst);
     }
 
     {
         ctx.startTimer(.build_distancefield_blur);
         defer ctx.stopTimer(.build_distancefield_blur);
-
-        // Blur
-        boxBlur(chf, 1, src, dst);
 
         // Store distance.
         chf.dist = dst;
