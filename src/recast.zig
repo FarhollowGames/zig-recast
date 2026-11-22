@@ -492,7 +492,7 @@ pub fn selectMax(a: f32, b: f32) f32 {
 /// On x86-64 that is the one instruction C's `(int)` compiles to; elsewhere
 /// the range is checked first.
 pub inline fn truncateToInt(x: f32) i32 {
-    if (comptime builtin.cpu.arch == .x86_64) {
+    if (builtin.cpu.arch == .x86_64 and !@inComptime()) {
         return asm ("cvttss2si %[x], %[ret]"
             : [ret] "=r" (-> i32),
             : [x] "x" (x),
@@ -523,6 +523,8 @@ test "truncateToInt gives x86-64's result at the edges of int's range, by either
         std.math.minInt(i32), std.math.minInt(i32), std.math.minInt(i32), std.math.minInt(i32),
         std.math.minInt(i32), std.math.minInt(i32), 0,                    8388607,
     };
+    try std.testing.expectEqual(-3, comptime truncateToInt(-3.7));
+    try std.testing.expectEqual(17, comptime calcGridSize(&.{ 0, 0, 0 }, &.{ 5, 1, 1 }, 0.3).width);
     for (truncate_edges, expected) |x, want| {
         try std.testing.expectEqual(want, truncateToInt(x));
         try std.testing.expectEqual(want, truncateToIntChecked(x));

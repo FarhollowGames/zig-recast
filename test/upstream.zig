@@ -163,6 +163,17 @@ pub extern fn shim_chf_build(
     hf: *Heightfield,
 ) ?*CompactHeightfield;
 pub extern fn shim_chf_free(chf: *CompactHeightfield) void;
+/// Replaces `chf`'s columns, spans and areas with copies of these.
+pub extern fn shim_chf_replace(
+    chf: *CompactHeightfield,
+    w: c_int,
+    h: c_int,
+    span_count: c_int,
+    cells: [*]const u32,
+    spans: [*]const u64,
+    areas: [*]const u8,
+) void;
+pub extern fn shim_chf_set_max_regions(chf: *CompactHeightfield, max_regions: c_int) void;
 pub extern fn shim_erode(log: *Log, radius: c_int, chf: *CompactHeightfield) c_int;
 pub extern fn shim_median(log: *Log, chf: *CompactHeightfield) c_int;
 pub extern fn shim_mark_box(

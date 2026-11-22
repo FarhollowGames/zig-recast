@@ -11,6 +11,10 @@ const builtin = @import("builtin");
 const recast = @import("recast");
 const upstream = @import("upstream.zig");
 const meshes = @import("meshes.zig");
+
+test {
+    _ = @import("odd_fields.zig");
+}
 const dump = @import("dump.zig").dump;
 
 const testing = std.testing;
