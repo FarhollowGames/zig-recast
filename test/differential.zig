@@ -1323,13 +1323,14 @@ test "spans added directly merge, wrap and filter as the original's" {
     }
 }
 
-test "the distance field matches on grids broken at every place of a run" {
+test "the distance field and contours match on grids broken at every place of a run" {
     // Flat floors, a field of them in 16-column runs where every column
     // holds one span joined to its neighbours, broken at random by holes,
     // a second floor above, columns with only that floor (whose
     // neighbours join index 1), steps too high to climb and other areas,
     // at densities from none to most columns; and fields narrower,
-    // shorter and a column or two wider than a run.
+    // shorter and a column or two wider than a run. Then the regions, with
+    // and without a border, and their contours.
     var prng: std.Random.DefaultPrng = .init(17);
     const random = prng.random();
     var logs = try Logs.init();
@@ -1341,7 +1342,7 @@ test "the distance field matches on grids broken at every place of a run" {
         .{ 100, 1 }, .{ 3, 100 }, .{ 130, 70 },
     };
     const densities = [_]u32{ 0, 1, 10, 100, 400, 1000 };
-    for (sizes) |size| for (densities) |per_thousand| for (0..2) |_| {
+    for (sizes) |size| for (densities) |per_thousand| for (0..2) |round| {
         const w = size[0];
         const h = size[1];
         const bmin: [3]f32 = .{ 0, 0, 0 };
@@ -1396,6 +1397,19 @@ test "the distance field matches on grids broken at every place of a run" {
         try testing.expect(upstream.shim_distance_field(logs.original, original_chf) != 0);
         try logs.expectSame("distance");
         try expectSameDump("distance", &chf, original_chf);
+
+        const border: i32 = if (round == 0) 0 else 3;
+        const regions = recast.buildRegions(ctx, gpa, &chf, border, 4, 20);
+        const original_regions = upstream.shim_regions(logs.original, original_chf, border, 4, 20);
+        if (!try sameOutcome(&logs, "regions", succeeded(regions), original_regions != 0)) continue;
+        try expectSameDump("regions", &chf, original_chf);
+        const original_cset = upstream.shim_contours_build(logs.original, original_chf, 1.3, 12, 1) orelse
+            return error.TestUnexpectedResult;
+        defer upstream.shim_contours_free(original_cset);
+        var cset = try recast.buildContours(ctx, gpa, &chf, 1.3, 12, .default);
+        defer cset.deinit(gpa);
+        try logs.expectSame("contours");
+        try expectSameDump("contours", &cset, original_cset);
     };
 }
 

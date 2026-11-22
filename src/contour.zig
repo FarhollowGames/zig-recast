@@ -9,6 +9,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const recast = @import("recast.zig");
+const grid = @import("grid.zig");
+const run_len = grid.run_len;
+const Run = grid.Run;
+const RowRuns = grid.RowRuns;
 const Context = recast.Context;
 const CompactHeightfield = recast.CompactHeightfield;
 const Contour = recast.Contour;
@@ -766,6 +770,57 @@ fn mergeRegionHoles(
     }
 }
 
+/// Sets the flags of the spans of column `col`, of a field `w` columns
+/// wide: a bit for each edge on the boundary of the span's region, in the
+/// order of the directions, or 0 for a span in no region or the border's.
+inline fn markBoundaries(
+    cells: [*]const recast.CompactCell,
+    spans: [*]const recast.CompactSpan,
+    flags: [*]u8,
+    w: usize,
+    col: usize,
+) void {
+    const c = cells[col];
+    const first: usize = c.index;
+    for (first..first + c.count) |i| {
+        var res: u8 = 0;
+        const s = spans[i];
+        if (s.reg == 0 or (s.reg & border_reg) != 0) {
+            flags[i] = 0;
+            continue;
+        }
+        for ([4]u2{ 0, 1, 2, 3 }) |dir| {
+            var r: u16 = 0;
+            if (getCon(s, dir) != not_connected) {
+                const a_col = switch (dir) {
+                    0 => col - 1,
+                    1 => col + w,
+                    2 => col + 1,
+                    3 => col - w,
+                };
+                r = spans[@as(usize, cells[a_col].index) + @as(usize, @intCast(getCon(s, dir)))].reg;
+            }
+            if (r == s.reg) res |= @as(u8, 1) << dir;
+        }
+        flags[i] = res ^ 0xf; // Inverse, mark non connected edges.
+    }
+}
+
+/// `markBoundaries` over a run of a grid's columns.
+inline fn markRunBoundaries(spans: [*]const recast.CompactSpan, flags: [*]u8, run: Run) void {
+    const Regs = @Vector(run_len, u16);
+    const Flags = @Vector(run_len, u8);
+    const reg = grid.regions(spans, run.at);
+    const one: Flags = @splat(1);
+    const zero: Flags = @splat(0);
+    var res = @select(u8, grid.regions(spans, run.at - 1) == reg, one, zero);
+    res |= @select(u8, grid.regions(spans, run.above) == reg, one << @splat(1), zero);
+    res |= @select(u8, grid.regions(spans, run.at + 1) == reg, one << @splat(2), zero);
+    res |= @select(u8, grid.regions(spans, run.below) == reg, one << @splat(3), zero);
+    const none = (reg == @as(Regs, @splat(0))) | (reg & @as(Regs, @splat(border_reg)) != @as(Regs, @splat(0)));
+    flags[run.at..][0..run_len].* = @select(u8, none, zero, res ^ @as(Flags, @splat(0xf)));
+}
+
 /// Traces the outline of every region of `chf` (built with its regions) and
 /// simplifies it. The raw contours follow the region outlines exactly;
 /// `max_error` and `max_edge_len` set how closely the simplified contours
@@ -820,36 +875,24 @@ pub fn buildContours(
 
     ctx.startTimer(.build_contours_trace);
 
-    // Mark boundaries. The cells and spans are read through local slices:
-    // through `chf`, every store to a flag would load them again.
-    const cells = chf.cells;
-    const spans = chf.spans;
-    var y: i32 = 0;
-    while (y < h) : (y += 1) {
-        var x: i32 = 0;
-        while (x < w) : (x += 1) {
-            const c = cells[@intCast(x + y * w)];
-            const first: usize = c.index;
-            for (first..first + c.count) |i| {
-                var res: u8 = 0;
-                const s = spans[i];
-                if (s.reg == 0 or (s.reg & border_reg) != 0) {
-                    flags[i] = 0;
-                    continue;
-                }
-                for ([4]u2{ 0, 1, 2, 3 }) |dir| {
-                    var r: u16 = 0;
-                    if (getCon(s, dir) != not_connected) {
-                        const ax = x + getDirOffsetX(dir);
-                        const ay = y + getDirOffsetY(dir);
-                        const a_first: usize = cells[@intCast(ax + ay * w)].index;
-                        r = spans[a_first + @as(usize, @intCast(getCon(s, dir)))].reg;
-                    }
-                    if (r == s.reg) res |= @as(u8, 1) << dir;
-                }
-                flags[i] = res ^ 0xf; // Inverse, mark non connected edges.
+    // Mark boundaries. The cells and spans are read through local
+    // pointers: through `chf`, every store to a flag would load them again.
+    const cells = chf.cells.ptr;
+    const spans = chf.spans.ptr;
+    const wu: usize = @intCast(@max(w, 0));
+    const hu: usize = @intCast(@max(h, 0));
+    for (0..hu) |yu| {
+        const runs: RowRuns = .of(wu, hu, yu);
+        for (yu * wu..runs.first) |col| markBoundaries(cells, spans, flags.ptr, wu, col);
+        var col = runs.first;
+        while (col < runs.end) : (col += run_len) {
+            if (Run.of(cells, spans, wu, col)) |run| {
+                markRunBoundaries(spans, flags.ptr, run);
+            } else {
+                for (col..col + run_len) |c| markBoundaries(cells, spans, flags.ptr, wu, c);
             }
         }
+        for (runs.end..yu * wu + wu) |c| markBoundaries(cells, spans, flags.ptr, wu, c);
     }
 
     ctx.stopTimer(.build_contours_trace);
@@ -861,10 +904,27 @@ pub fn buildContours(
     defer simplified.deinit(gpa);
     try simplified.ensureTotalCapacity(gpa, 64);
 
-    y = 0;
+    var y: i32 = 0;
     while (y < h) : (y += 1) {
+        const runs: RowRuns = .of(wu, hu, @intCast(y));
+        const runs_end: i32 = @intCast(runs.end - runs.first);
         var x: i32 = 0;
         while (x < w) : (x += 1) {
+            // A run of a grid's columns whose spans all have every edge
+            // or none on the boundary starts no contour, and its flags go
+            // to 0 as the loop below would set them.
+            if (x >= 1 and x <= runs_end and @rem(x - 1, run_len) == 0) {
+                if (Run.row(cells, spans, @intCast(x + y * w))) |at| {
+                    const Flags = @Vector(run_len, u8);
+                    const run_flags: Flags = flags[at..][0..run_len].*;
+                    const zero: Flags = @splat(0);
+                    if (@reduce(.And, (run_flags == zero) | (run_flags == @as(Flags, @splat(0xf))))) {
+                        flags[at..][0..run_len].* = zero;
+                        x += run_len - 1;
+                        continue;
+                    }
+                }
+            }
             const c = chf.cells[@intCast(x + y * w)];
             const first: usize = c.index;
             for (first..first + c.count) |i| {

@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
 const recast = @import("recast.zig");
+const grid = @import("grid.zig");
 const Context = recast.Context;
 const CompactHeightfield = recast.CompactHeightfield;
 const getCon = recast.getCon;
@@ -166,65 +167,11 @@ inline fn blurSpan(v: DistanceView, dist: [*]const u16, col: usize, i: usize) u1
 /// far from the border keep their distance.
 const blur_threshold = 2;
 
-/// Columns a run takes: 16 lanes of 32 bits, one AVX-512 register.
-const run_len = 16;
+const run_len = grid.run_len;
+const Run = grid.Run;
+const RowRuns = grid.RowRuns;
 const RunU32 = @Vector(run_len, u32);
 const RunU16 = @Vector(run_len, u16);
-
-/// A run of `run_len` columns in a row, from column `col`, whose columns
-/// and the columns around them, from one before it to one after it in the
-/// rows below, at and above it, each hold one span, connected to the span
-/// of the column next to it on every side, and each row's spans follow one
-/// another. There every neighbour of a span is the span of the
-/// neighbouring column, so a row's distances are a row of a grid, and the
-/// first is that of the span `below`, `at` or `above`.
-const Run = struct {
-    below: usize,
-    at: usize,
-    above: usize,
-
-    /// The run from column `col`, or null where its columns are not as
-    /// `Run` needs. `col` must be at least a row and a column from every
-    /// edge of the field, `run_len` columns and one more from the east one.
-    fn of(v: DistanceView, col: usize) ?Run {
-        const below = rowRun(v, col - v.width) orelse return null;
-        const at = rowRun(v, col) orelse return null;
-        const above = rowRun(v, col + v.width) orelse return null;
-        return .{ .below = below, .at = at, .above = above };
-    }
-
-    /// The span of column `col` if columns `col` - 1 to `col` + `run_len`
-    /// of one row each hold one span, with connections of index 0 on every
-    /// side, at consecutive indices; null otherwise.
-    fn rowRun(v: DistanceView, col: usize) ?usize {
-        const Cells = @Vector(run_len, u32);
-        const words: [*]const u32 = @ptrCast(v.cells);
-        const first = words[col - 1];
-        // One span, and an index that the run's last does not carry past
-        // the 24 bits of `index` into `count`.
-        if (first >> 24 != 1 or (first & 0xffffff) + run_len + 1 > 0xffffff) return null;
-        const step = std.simd.iota(u32, run_len);
-        const lo: Cells = words[col - 1 ..][0..run_len].*;
-        const hi: Cells = words[col + 1 ..][0..run_len].*;
-        const want: Cells = @as(Cells, @splat(first)) + step;
-        if (@reduce(.Or, lo != want) or @reduce(.Or, hi != want + @as(Cells, @splat(2)))) return null;
-        // Every connection 0: all 24 bits of `con` clear.
-        const span_first: usize = first & 0xffffff;
-        const Words = @Vector(run_len, u64);
-        const spans: [*]const u64 = @ptrCast(v.spans);
-        const con_mask: Words = @splat(@as(u64, 0xffffff) << 32);
-        const s_lo: Words = spans[span_first..][0..run_len].*;
-        const s_hi: Words = spans[span_first + 2 ..][0..run_len].*;
-        if (@reduce(.Or, (s_lo | s_hi) & con_mask) != 0) return null;
-        return span_first + 1;
-    }
-};
-
-comptime {
-    // `Run.rowRun` reads the cells and spans as words.
-    assert(@bitSizeOf(recast.CompactCell) == 32 and @bitOffsetOf(recast.CompactCell, "count") == 24);
-    assert(@bitSizeOf(recast.CompactSpan) == 64 and @bitOffsetOf(recast.CompactSpan, "con") == 32);
-}
 
 /// The `run_len` values of `values` from `i`, widened.
 inline fn load16(values: [*]const u16, i: usize) RunU32 {
@@ -308,20 +255,6 @@ inline fn blurRun(src: [*]const u16, dst: [*]u16, run: Run) void {
     dst[run.at..][0..run_len].* = @as(RunU16, @intCast(@select(u32, keep, cd, mean)));
 }
 
-/// Where a row's runs start and end: from column 1 of the row, as many
-/// whole runs as leave a column after them. Rows 0 and h - 1 have none.
-const RowRuns = struct {
-    first: usize,
-    end: usize,
-
-    fn of(w: usize, h: usize, y: usize) RowRuns {
-        const row = y * w;
-        if (y == 0 or y + 1 >= h or w < run_len + 2) return .{ .first = row, .end = row };
-        const runs = (w - 2) / run_len;
-        return .{ .first = row + 1, .end = row + 1 + runs * run_len };
-    }
-};
-
 /// Marks and sweeps up the spans of column `col`.
 inline fn sweepUpColumn(v: DistanceView, dist: [*]u16, col: usize) void {
     const c = v.cells[col];
@@ -365,7 +298,7 @@ fn blurRow(v: DistanceView, src: [*]const u16, dst: [*]u16, h: usize, y: usize) 
     for (y * w..runs.first) |col| blurColumn(v, src, dst, col);
     var col = runs.first;
     while (col < runs.end) : (col += run_len) {
-        if (Run.of(v, col)) |run| {
+        if (Run.of(v.cells, v.spans, v.width, col)) |run| {
             blurRun(src, dst, run);
         } else {
             for (col..col + run_len) |c| blurColumn(v, src, dst, c);
@@ -410,7 +343,7 @@ fn distanceField(chf: *const CompactHeightfield, src: []u16, dst: []u16) u16 {
         for (y * w..runs.first) |col| sweepUpColumn(v, dist, col);
         var col = runs.first;
         while (col < runs.end) : (col += run_len) {
-            if (Run.of(v, col)) |run| {
+            if (Run.of(v.cells, v.spans, v.width, col)) |run| {
                 sweepUpRun(v, dist, run);
             } else {
                 for (col..col + run_len) |c| sweepUpColumn(v, dist, c);
@@ -432,7 +365,7 @@ fn distanceField(chf: *const CompactHeightfield, src: []u16, dst: []u16) u16 {
         }
         while (col > runs.first) {
             col -= run_len;
-            if (Run.of(v, col)) |run| {
+            if (Run.of(v.cells, v.spans, v.width, col)) |run| {
                 sweepDownRun(dist, run);
             } else {
                 var c = col + run_len;
