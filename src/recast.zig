@@ -489,11 +489,14 @@ pub fn selectMax(a: f32, b: f32) f32 {
 
 /// C's `(int)x` as x86-64 computes it: toward zero, and the most negative
 /// int for NaN and values out of range, where C leaves the result undefined.
-/// On x86-64 that is the one instruction C's `(int)` compiles to; elsewhere
-/// the range is checked first.
-pub inline fn truncateToInt(x: f32) i32 {
+/// On x86-64 that is the one instruction C's `(int)` compiles to, in its
+/// VEX encoding where the CPU has AVX, as the compiler would emit it, so
+/// that it does not mix legacy SSE into AVX code; elsewhere the range is
+/// checked first.
+pub fn truncateToInt(x: f32) i32 {
     if (builtin.cpu.arch == .x86_64 and !@inComptime()) {
-        return asm ("cvttss2si %[x], %[ret]"
+        const avx = comptime std.Target.x86.featureSetHas(builtin.cpu.features, .avx);
+        return asm ((if (avx) "vcvttss2si" else "cvttss2si") ++ " %[x], %[ret]"
             : [ret] "=r" (-> i32),
             : [x] "x" (x),
         );
@@ -524,6 +527,9 @@ test "truncateToInt gives x86-64's result at the edges of int's range, by either
         std.math.minInt(i32), std.math.minInt(i32), 0,                    8388607,
     };
     try std.testing.expectEqual(-3, comptime truncateToInt(-3.7));
+    // A function, so that its address can be taken.
+    const by_pointer: *const fn (f32) i32 = &truncateToInt;
+    try std.testing.expectEqual(1, by_pointer(1.5));
     try std.testing.expectEqual(17, comptime calcGridSize(&.{ 0, 0, 0 }, &.{ 5, 1, 1 }, 0.3).width);
     for (truncate_edges, expected) |x, want| {
         try std.testing.expectEqual(want, truncateToInt(x));
