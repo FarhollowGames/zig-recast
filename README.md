@@ -35,10 +35,10 @@ dependencies beyond the standard library. The original is listed under
 ## Install
 
 ```sh
-zig fetch --save git+https://github.com/farhollowgames/zig-recast#v0.1.1
+zig fetch --save git+https://github.com/farhollowgames/zig-recast#v0.1.4
 ```
 
-`v0.1.1` is the latest release. The package needs Zig 0.17.0.
+`v0.1.4` is the latest release. The package needs Zig 0.17.0.
 
 In `build.zig`:
 
