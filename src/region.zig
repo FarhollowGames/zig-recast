@@ -56,6 +56,8 @@ const DistanceView = struct {
     width: usize,
     height: usize,
     columns: usize,
+    /// The number of spans, and of distances.
+    spans_len: usize,
 
     fn of(chf: *const CompactHeightfield) DistanceView {
         const w: usize = @intCast(@max(chf.width, 0));
@@ -67,6 +69,7 @@ const DistanceView = struct {
             .width = w,
             .height = h,
             .columns = w * h,
+            .spans_len = @intCast(@max(chf.span_count, 0)),
         };
     }
 
@@ -263,6 +266,7 @@ const run_len = grid.run_len;
 const Run = grid.Run;
 const RowRuns = grid.RowRuns;
 const emptyBlock = grid.emptyBlock;
+const sparseBlock = grid.sparseBlock;
 const RunU32 = @Vector(run_len, u32);
 const RunU16 = @Vector(run_len, u16);
 
@@ -633,6 +637,15 @@ inline fn blurColumnInner(v: DistanceView, src: [*]const u16, dst: [*]u16, col: 
     }
 }
 
+/// Whether every span of a block's `sparse` spans has a distance of at
+/// most `limit`; false where the spans' vector would run past `count`.
+inline fn allAtMost(dist: [*]const u16, count: usize, sparse: grid.Sparse, limit: u16) bool {
+    if (sparse.first + run_len > count) return false;
+    const in = std.simd.iota(u32, run_len) < @as(RunU32, @splat(@intCast(sparse.n)));
+    const d: RunU16 = dist[sparse.first..][0..run_len].*;
+    return !@reduce(.Or, in & (d > @as(RunU16, @splat(limit))));
+}
+
 /// Blurs row `y` of `src` into `dst`.
 fn blurRow(v: DistanceView, src: [*]const u16, dst: [*]u16, y: usize) void {
     const w = v.width;
@@ -647,6 +660,16 @@ fn blurRow(v: DistanceView, src: [*]const u16, dst: [*]u16, y: usize) void {
     while (col < runs.end) : (col += run_len) {
         if (Run.of(v.cells, v.spans, w, col)) |run| {
             blurRun(src, dst, run);
+        } else if (sparseBlock(v.cells, col)) |sparse| {
+            if (allAtMost(src, v.spans_len, sparse, blur_threshold)) {
+                // Every span keeps its distance.
+                const in = std.simd.iota(u32, run_len) < @as(RunU32, @splat(@intCast(sparse.n)));
+                const kept: RunU16 = dst[sparse.first..][0..run_len].*;
+                const d: RunU16 = src[sparse.first..][0..run_len].*;
+                dst[sparse.first..][0..run_len].* = @select(u16, in, d, kept);
+            } else {
+                for (col..col + run_len) |c| blurColumnInner(v, src, dst, c);
+            }
         } else if (!emptyBlock(v.cells, col)) {
             for (col..col + run_len) |c| blurColumnInner(v, src, dst, c);
         }
@@ -704,6 +727,15 @@ fn sweepDownRow(v: DistanceView, dist: [*]u16, y: usize) void {
         col -= run_len;
         if (Run.of(v.cells, v.spans, w, col)) |run| {
             sweepDownRun(dist, run);
+        } else if (sparseBlock(v.cells, col)) |sparse| {
+            // Spans at 0 keep 0.
+            if (!allAtMost(dist, v.spans_len, sparse, 0)) {
+                var c = col + run_len;
+                while (c > col) {
+                    c -= 1;
+                    sweepDownColumnInner(v, dist, c);
+                }
+            }
         } else if (!emptyBlock(v.cells, col)) {
             var c = col + run_len;
             while (c > col) {

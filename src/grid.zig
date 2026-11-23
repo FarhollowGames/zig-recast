@@ -118,6 +118,41 @@ pub inline fn emptyBlock(cells: [*]const CompactCell, col: usize) bool {
     return @reduce(.Or, block >> @splat(24)) == 0;
 }
 
+/// The spans of a block of columns that each hold at most one: `n` of
+/// them from `first`.
+pub const Sparse = struct { first: usize, n: usize };
+
+/// The spans of the `run_len` columns from `col` where each holds at most
+/// one span and those spans follow one another in the columns' order; null
+/// otherwise, or where they have none.
+pub inline fn sparseBlock(cells: [*]const CompactCell, col: usize) ?Sparse {
+    const Words = @Vector(run_len, u32);
+    const words: [*]const u32 = @ptrCast(cells);
+    const block: Words = words[col..][0..run_len].*;
+    const counts = block >> @splat(24);
+    if (@reduce(.Or, counts > @as(Words, @splat(1)))) return null;
+    const n = @reduce(.Add, counts);
+    if (n == 0) return null;
+    // The spans before each column in the block, a running sum.
+    var before = counts;
+    comptime var shift: i32 = 1;
+    inline while (shift < run_len) : (shift *= 2) {
+        const mask = comptime blk: {
+            var m: [run_len]i32 = undefined;
+            for (&m, 0..) |*e, k| e.* = if (@as(i32, k) - shift >= 0) @as(i32, k) - shift else -1;
+            break :blk m;
+        };
+        before += @shuffle(u32, before, @as(Words, @splat(0)), mask);
+    }
+    before -= counts;
+    const index = block & @as(Words, @splat(0xffffff));
+    const has = counts == @as(Words, @splat(1));
+    const first = @reduce(.Min, @select(u32, has, index, @as(Words, @splat(std.math.maxInt(u32)))));
+    const want = @as(Words, @splat(first)) + before;
+    if (@reduce(.Or, has & (index != want))) return null;
+    return .{ .first = first, .n = n };
+}
+
 /// The region ids of the `run_len` spans from `i`.
 pub inline fn regions(spans: [*]const CompactSpan, i: usize) @Vector(run_len, u16) {
     const Spans = @Vector(run_len, u64);
