@@ -163,6 +163,39 @@ pub const Builder = struct {
     }
 };
 
+/// `floors` flat floors of `size` by `size` units, 3 apart from height 0,
+/// each one quad: the storeys of a car park, every column of the field the
+/// same depth.
+pub fn storeys(gpa: Allocator, size: f32, floors: u32) !Mesh {
+    var b: Builder = .{ .gpa = gpa };
+    errdefer b.deinit();
+    for (0..floors) |f| {
+        const y: f32 = @as(f32, @floatFromInt(f)) * 3;
+        try b.quad(.{ .{ 0, y, 0 }, .{ 0, y, size }, .{ size, y, size }, .{ size, y, 0 } });
+    }
+    return b.finish();
+}
+
+/// Flat ground of `size` by `size` units with a post 2 tall and `width`
+/// across every unit along both axes: a field broken by obstacles too
+/// small and close for long runs of open columns.
+pub fn posts(gpa: Allocator, size: i32, width: f32) !Mesh {
+    var b: Builder = .{ .gpa = gpa };
+    errdefer b.deinit();
+    const s: f32 = @floatFromInt(size);
+    try b.quad(.{ .{ 0, 0, 0 }, .{ 0, 0, s }, .{ s, 0, s }, .{ s, 0, 0 } });
+    var z: i32 = 0;
+    while (z < size) : (z += 1) {
+        var x: i32 = 0;
+        while (x < size) : (x += 1) {
+            const cx: f32 = @as(f32, @floatFromInt(x)) + 0.5;
+            const cz: f32 = @as(f32, @floatFromInt(z)) + 0.5;
+            try b.box(.{ cx - width / 2, -0.1, cz - width / 2 }, .{ cx + width / 2, 2, cz + width / 2 });
+        }
+    }
+    return b.finish();
+}
+
 /// A value in [0, 1) from a grid point, the same on every machine.
 fn hash(x: i32, z: i32, seed: u32) f32 {
     var h: u32 = @bitCast(x *% 374761393 +% z *% 668265263);

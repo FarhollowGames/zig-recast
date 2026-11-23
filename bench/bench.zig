@@ -996,8 +996,20 @@ const Input = struct {
     tiles: []Tile,
     original: [feature_count]?Summary = @splat(null),
     port: [feature_count]?Summary = @splat(null),
+    /// The highest of the tiles' ratios, each of its medians, for a
+    /// feature timed per tile on an input of more than one tile.
+    worst: [feature_count]?f64 = @splat(null),
     work: Work = @splat(0),
 };
+
+/// Adds a tile's times to a run's.
+fn addTimes(total: *Times, tile: Times) void {
+    for (total, tile) |*t, add| {
+        const a = add orelse continue;
+        if (t.* == failed) continue;
+        t.* = if (a == failed) failed else (t.* orelse 0) + a;
+    }
+}
 
 /// A feature's times over the runs: the median, and the spread from the
 /// fastest to the slowest run; all `failed` where it failed.
@@ -1063,30 +1075,28 @@ fn printAmount(amount: u64) void {
     }
 }
 
-fn printRow(name: []const u8, about: Info, amount: u64, original: Summary, port: Summary) void {
+fn printRow(name: []const u8, about: Info, amount: u64, original: Summary, port: Summary, worst: ?f64) void {
     std.debug.print("| {s} |", .{name});
     printAmount(amount);
     std.debug.print(" {s} |", .{about.per.name()});
     if (original.median == failed or port.median == failed) {
         const original_says = if (original.median == failed) "fails" else "works";
         const port_says = if (port.median == failed) "fails" else "works";
-        std.debug.print(" {s} | {s} | | |\n", .{ original_says, port_says });
+        std.debug.print(" {s} | {s} | | | |\n", .{ original_says, port_says });
         return;
     }
     printTime(original.median, about, amount);
     printTime(port.median, about, amount);
     const ratio = @as(f64, @floatFromInt(port.median)) /
         @as(f64, @floatFromInt(@max(original.median, 1)));
-    std.debug.print(" {d:.2} | {d:.1}% / {d:.1}% |\n", .{
-        ratio,
-        original.spread() * 100,
-        port.spread() * 100,
-    });
+    std.debug.print(" {d:.2} |", .{ratio});
+    if (worst) |w| std.debug.print(" {d:.2} |", .{w}) else std.debug.print(" |", .{});
+    std.debug.print(" {d:.1}% / {d:.1}% |\n", .{ original.spread() * 100, port.spread() * 100 });
 }
 
 const table_head =
-    \\| input | work | original | port | port ÷ original | spread, original / port |
-    \\| --- | ---: | ---: | ---: | ---: | ---: |
+    \\| input | work | original | port | port ÷ original | worst tile | spread, original / port |
+    \\| --- | ---: | ---: | ---: | ---: | ---: | ---: |
     \\
 ;
 
@@ -1099,11 +1109,15 @@ const input_specs = [_]InputSpec{
     .{ .name = "terrain 256 m, 64 m tiles", .source = .terrain, .tiled = true },
     .{ .name = "vale 256 m, 64 m tiles", .source = .vale, .tiled = true },
     .{ .name = "vale 1 km, 64 m tiles", .source = .vale_large, .tiled = true },
+    .{ .name = "dungeon.obj, 64 m tiles", .source = .dungeon, .tiled = true },
+    .{ .name = "nav_test.obj, 64 m tiles", .source = .nav_test, .tiled = true },
+    .{ .name = "two storeys 128 m, 64 m tiles", .source = .storeys, .tiled = true },
+    .{ .name = "posts 128 m, 64 m tiles", .source = .posts, .tiled = true },
 };
 
 const InputSpec = struct {
     name: []const u8,
-    source: enum { dungeon, nav_test, undulating, terrain, vale, vale_large },
+    source: enum { dungeon, nav_test, undulating, terrain, vale, vale_large, storeys, posts },
     /// Built in Loomwork's tiles, or whole with RecastDemo's defaults.
     tiled: bool = false,
 };
@@ -1149,6 +1163,8 @@ pub fn main(init: std.process.Init) !void {
             .terrain => try meshes.terrain(arena, 256, 1),
             .vale => try meshes.vale(arena, 256),
             .vale_large => try meshes.vale(arena, 1024),
+            .storeys => try meshes.storeys(arena, 128, 2),
+            .posts => try meshes.posts(arena, 128, 0.25),
         };
         var bmin: [3]f32 = undefined;
         var bmax: [3]f32 = undefined;
@@ -1176,6 +1192,8 @@ pub fn main(init: std.process.Init) !void {
     for (inputs.items) |*input| {
         const original_built = try arena.alloc(OriginalMeshes, input.tiles.len);
         const port_built = try arena.alloc(PortMeshes, input.tiles.len);
+        const tile_original_runs = try arena.alloc(Times, input.tiles.len * runs);
+        const tile_port_runs = try arena.alloc(Times, input.tiles.len * runs);
         for (0..warmups + runs) |run| {
             var original: Times = @splat(null);
             var port: Times = @splat(null);
@@ -1184,10 +1202,18 @@ pub fn main(init: std.process.Init) !void {
             // always the one that finds the tile's input in the cache.
             const original_first = run % 2 == 0;
             const verts = input.mesh.verts;
-            for (input.tiles, original_built, port_built) |*tile, *o, *p| {
-                if (original_first) o.* = try buildOriginal(io, log, verts, tile, &original);
-                p.* = try buildPort(io, gpa, verts, tile, &port, &work);
-                if (!original_first) o.* = try buildOriginal(io, log, verts, tile, &original);
+            for (input.tiles, original_built, port_built, 0..) |*tile, *o, *p, t| {
+                var tile_original: Times = @splat(null);
+                var tile_port: Times = @splat(null);
+                if (original_first) o.* = try buildOriginal(io, log, verts, tile, &tile_original);
+                p.* = try buildPort(io, gpa, verts, tile, &tile_port, &work);
+                if (!original_first) o.* = try buildOriginal(io, log, verts, tile, &tile_original);
+                addTimes(&original, tile_original);
+                addTimes(&port, tile_port);
+                if (run >= warmups) {
+                    tile_original_runs[t * runs + run - warmups] = tile_original;
+                    tile_port_runs[t * runs + run - warmups] = tile_port;
+                }
             }
             if (original_first) try wholeOriginal(io, log, input.mesh, original_built, &original);
             try wholePort(io, gpa, input.mesh, port_built, &port);
@@ -1212,6 +1238,14 @@ pub fn main(init: std.process.Init) !void {
         for (0..feature_count) |f| {
             input.original[f] = try Summary.of(arena, original_runs, f);
             input.port[f] = try Summary.of(arena, port_runs, f);
+            if (input.tiles.len < 2) continue;
+            for (0..input.tiles.len) |t| {
+                const o = try Summary.of(arena, tile_original_runs[t * runs ..][0..runs], f) orelse continue;
+                const p = try Summary.of(arena, tile_port_runs[t * runs ..][0..runs], f) orelse continue;
+                if (o.median == failed or p.median == failed or o.median == 0) continue;
+                const ratio = @as(f64, @floatFromInt(p.median)) / @as(f64, @floatFromInt(o.median));
+                input.worst[f] = @max(input.worst[f] orelse ratio, ratio);
+            }
         }
     }
 
@@ -1236,7 +1270,7 @@ pub fn main(init: std.process.Init) !void {
             const original = input.original[@backingInt(feature)] orelse continue;
             const port = input.port[@backingInt(feature)] orelse continue;
             const amount = if (about.calls > 0) about.calls else input.work[@backingInt(about.per)];
-            printRow(input.name, about, amount, original, port);
+            printRow(input.name, about, amount, original, port, input.worst[@backingInt(feature)]);
         }
     }
 }
