@@ -773,13 +773,16 @@ fn mergeRegionHoles(
 /// Sets the flags of the spans of column `col`, of a field `w` columns
 /// wide: a bit for each edge on the boundary of the span's region, in the
 /// order of the directions, or 0 for a span in no region or the border's.
+/// Returns nonzero where a span has some edges on the boundary and some
+/// not, which the scan for contours stops at.
 inline fn markBoundaries(
     cells: [*]const recast.CompactCell,
     spans: [*]const recast.CompactSpan,
     flags: [*]u8,
     w: usize,
     col: usize,
-) void {
+) u8 {
+    var walk: u8 = 0;
     const c = cells[col];
     const first: usize = c.index;
     for (first..first + c.count) |i| {
@@ -803,8 +806,14 @@ inline fn markBoundaries(
             if (r == s.reg) res |= @as(u8, 1) << dir;
         }
         flags[i] = res ^ 0xf; // Inverse, mark non connected edges.
+        walk |= @intFromBool(res != 0 and res != 0xf);
     }
+    return walk;
 }
+
+/// The rows the boundary marking keeps track of, for the contour scan to
+/// skip those it need not visit; any after them are all visited.
+const max_marked_rows = 8192;
 
 /// Whether every span of a run's row has every edge or none on the
 /// boundary, and if so sets their flags to 0.
@@ -823,7 +832,8 @@ inline fn skipRun(flags: [*]u8, run_row: Run.Row) bool {
 }
 
 /// `markBoundaries` over a run of a grid's columns.
-inline fn markRunBoundaries(spans: [*]const recast.CompactSpan, flags: [*]u8, run: Run) void {
+inline fn markRunBoundaries(spans: [*]const recast.CompactSpan, flags: [*]u8, run: Run) u8 {
+    var walk: u8 = 0;
     switch (run.layers) {
         inline 1, 2, 4 => |layers| inline for (0..layers) |part| {
             const at = run.at + part * run_len;
@@ -837,10 +847,13 @@ inline fn markRunBoundaries(spans: [*]const recast.CompactSpan, flags: [*]u8, ru
             res |= @select(u8, grid.regions(spans, at + layers) == reg, one << @splat(2), zero);
             res |= @select(u8, grid.regions(spans, run.below + part * run_len) == reg, one << @splat(3), zero);
             const none = (reg == @as(Regs, @splat(0))) | (reg & @as(Regs, @splat(border_reg)) != @as(Regs, @splat(0)));
-            flags[at..][0..run_len].* = @select(u8, none, zero, res ^ @as(Flags, @splat(0xf)));
+            const f = @select(u8, none, zero, res ^ @as(Flags, @splat(0xf)));
+            flags[at..][0..run_len].* = f;
+            walk |= @intFromBool(@reduce(.Or, (f != zero) & (f != @as(Flags, @splat(0xf)))));
         },
         else => unreachable,
     }
+    return walk;
 }
 
 /// Traces the outline of every region of `chf` (built with its regions) and
@@ -903,18 +916,26 @@ pub fn buildContours(
     const spans = chf.spans.ptr;
     const wu: usize = @intCast(@max(w, 0));
     const hu: usize = @intCast(@max(h, 0));
+    // The rows with a span that has some edges on the boundary and some
+    // not: the scan below walks a contour only from such a span, and a
+    // walk only clears edges, so the other rows hold none for it to find.
+    // Their spans' flags stay as marked rather than going to 0, which no
+    // walk reads: a walk follows only edges inside its region.
+    var walk_rows: std.bit_set.Static(max_marked_rows) = .empty;
     for (0..hu) |yu| {
+        var walk: u8 = 0;
         const runs: RowRuns = .of(wu, hu, yu);
-        for (yu * wu..runs.first) |col| markBoundaries(cells, spans, flags.ptr, wu, col);
+        for (yu * wu..runs.first) |col| walk |= markBoundaries(cells, spans, flags.ptr, wu, col);
         var col = runs.first;
         while (col < runs.end) : (col += run_len) {
             if (Run.of(cells, spans, wu, col)) |run| {
-                markRunBoundaries(spans, flags.ptr, run);
+                walk |= markRunBoundaries(spans, flags.ptr, run);
             } else if (!grid.emptyBlock(cells, col)) {
-                for (col..col + run_len) |c| markBoundaries(cells, spans, flags.ptr, wu, c);
+                for (col..col + run_len) |c| walk |= markBoundaries(cells, spans, flags.ptr, wu, c);
             }
         }
-        for (runs.end..yu * wu + wu) |c| markBoundaries(cells, spans, flags.ptr, wu, c);
+        for (runs.end..yu * wu + wu) |c| walk |= markBoundaries(cells, spans, flags.ptr, wu, c);
+        if (yu < max_marked_rows and walk != 0) walk_rows.set(yu);
     }
 
     ctx.stopTimer(.build_contours_trace);
@@ -928,6 +949,7 @@ pub fn buildContours(
 
     var y: i32 = 0;
     while (y < h) : (y += 1) {
+        if (y < max_marked_rows and !walk_rows.isSet(@intCast(y))) continue;
         const runs: RowRuns = .of(wu, hu, @intCast(y));
         const runs_end: i32 = @intCast(runs.end - runs.first);
         // The next column that starts a block of `run_len`, from column 1.
@@ -952,16 +974,16 @@ pub fn buildContours(
                     }
                 }
             }
-            const c = chf.cells[@intCast(x + y * w)];
+            const c = cells[@intCast(x + y * w)];
             const first: usize = c.index;
             for (first..first + c.count) |i| {
                 if (flags[i] == 0 or flags[i] == 0xf) {
                     flags[i] = 0;
                     continue;
                 }
-                const reg = chf.spans[i].reg;
+                const reg = spans[i].reg;
                 if (reg == 0 or (reg & border_reg) != 0) continue;
-                const area = chf.areas[i];
+                const area = chf.areas.ptr[i];
 
                 verts.clearRetainingCapacity();
                 simplified.clearRetainingCapacity();

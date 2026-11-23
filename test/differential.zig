@@ -1342,9 +1342,11 @@ test "the distance field and contours match on grids broken at every place of a 
     defer logs.deinit();
     const ctx = logs.port();
     const sizes = [_][2]i32{
-        .{ 1, 1 },   .{ 17, 3 },  .{ 18, 3 },   .{ 19, 4 },  .{ 33, 5 },
-        .{ 34, 6 },  .{ 35, 3 },  .{ 50, 2 },   .{ 51, 30 }, .{ 66, 40 },
+        .{ 1, 1 },   .{ 17, 3 },  .{ 18, 3 },   .{ 19, 4 },   .{ 33, 5 },
+        .{ 34, 6 },  .{ 35, 3 },  .{ 50, 2 },   .{ 51, 30 },  .{ 66, 40 },
         .{ 100, 1 }, .{ 3, 100 }, .{ 130, 70 },
+        // Taller than the rows the contours' boundary marking keeps.
+        .{ 4, 8300 },
     };
     const densities = [_]u32{ 0, 1, 10, 100, 400, 1000 };
     for ([_]usize{ 1, 2, 4 }) |layers| for (sizes) |size| for (densities) |per_thousand| for (0..2) |round| {
