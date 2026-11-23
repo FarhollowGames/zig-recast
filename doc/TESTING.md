@@ -136,17 +136,18 @@ compare with glibc's `cosf` are skipped.
 
 ### Tests and counts
 
-`zig build test` runs 81 tests: 25 unit tests in `src/`, on the port alone,
-and 56 tests in `test/` that run the original beside the port. The test
-runner counts 83, with the two blocks that pull the test files in.
+`zig build test` runs 95 tests: 27 unit tests in `src/`, on the port alone,
+and 68 tests in `test/` that run the original beside the port. The test
+runner counts 98, with the three blocks that pull the test files in.
 
 | file | tests | what they run |
 | --- | ---: | --- |
-| `test/differential.zig` | 20 | the meshes through every step under many settings; named cases for each step; the context and the constants; the cosine against glibc's; Loomwork's tiles; the thread test |
+| `test/differential.zig` | 21 | the meshes through every step under many settings; named cases for each step; the context and the constants; the cosine against glibc's; Loomwork's tiles; the thread test; grids of one, two and four floors broken at every place of a 16-column run, through the distance field, regions and contours |
+| `test/odd_fields.zig` | 11 | compact heightfields built by hand, as `buildCompactHeightfield` never builds them, swapped into both sides: connections past a column's spans or out of a row's edge, columns sharing spans, spans out of order or after unused ones, through the distance field, regions and contours |
 | `test/fuzz.zig` | 11 | the ten fuzz tests (named "fuzz: …") and every direction of the direction helpers |
 | `test/edges.zig` | 12 | hand-made edge cases, each through the whole build |
 | `test/upstream_tests.zig` | 13 | upstream's own `Tests/Recast` cases, section by section, on both sides; the port must also give what each upstream test requires |
-| `src/*.zig` | 25 | the port alone: helpers, the two refusals, the cosine, and every allocation of a build failed in turn |
+| `src/*.zig` | 27 | the port alone: helpers, the two refusals, the cosine, every allocation of a build failed in turn, the float-to-int conversion at the edges of int's range on both of its paths, and the distance field's fast passes against its passes in the original's order on 300 random fields |
 
 [`STATUS.md`](../STATUS.md) names the tests of every function, and
 [`parity.md`](parity.md) maps each function of the original to the port's.

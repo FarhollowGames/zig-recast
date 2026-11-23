@@ -17,8 +17,10 @@ tests and the benchmark only), from `Recast.h`, `RecastAlloc.h` and
 
 A performance pass and a skeptic's review by an agent that did not write
 the port have gone over every feature below, and the author has read their
-findings, so every row is reviewed; the state after "reviewed" is the
-furthest its tests and the benchmark go. Every feature is at least
+findings, so every row is reviewed. A second pass, on the distance field,
+the contours and grid size, had two more such reviews, one of them against
+Loomwork's needs, and their findings were fixed. The state after
+"reviewed" is the furthest its tests and the benchmark go. Every feature is at least
 oracle-tested, except the allocation functions, which have no output to
 compare; a test fails each allocation of a whole build in turn and checks
 that nothing leaks.
@@ -78,7 +80,7 @@ tests.
 | `rcGetDirOffsetX`, `rcGetDirOffsetY`, `rcGetDirForOffset` | `getDirOffsetX`, `getDirOffsetY`, `getDirForOffset` | "directions and their offsets match for every direction", over every input | reviewed, oracle-tested |
 | `rcMin`, `rcMax`, `rcClamp`, `rcSqrt` | `selectMin`, `selectMax`, `clamp`, `@sqrt` | "fuzz: min, max, clamp, square root and float to int match C++"; upstream | reviewed, oracle-tested |
 | `rcVcross`, `rcVdot`, `rcVmad`, `rcVadd`, `rcVsub`, `rcVmin`, `rcVmax`, `rcVdist`, `rcVdistSqr`, `rcVnormalize` | `vcross`, `vdot`, `vmad`, `vadd`, `vsub`, `vmin`, `vmax`, `vdist`, `vdistSqr`, `vnormalize` | "fuzz: vector helpers give the same floats"; upstream | reviewed, oracle-tested |
-| C's `(int)` of a float | `truncateToInt` | "fuzz: min, max, clamp, square root and float to int match C++" | reviewed, oracle-tested |
+| C's `(int)` of a float | `truncateToInt` | "fuzz: min, max, clamp, square root and float to int match C++"; "truncateToInt gives x86-64's result at the edges of int's range, by either path" | reviewed, oracle-tested |
 
 The connection, direction, scalar and vector helpers are timed only inside
 the benchmarked steps that call them: on their own, each is a few
@@ -115,7 +117,8 @@ instructions.
 
 | upstream | zig-recast | tests | state |
 | --- | --- | --- | --- |
-| `rcBuildDistanceField` | `buildDistanceField` | meshes; scenes | reviewed, benchmarked |
+| `rcBuildDistanceField` | `buildDistanceField` | "the distance field and contours match on grids broken at every place of a run"; the `odd_fields.zig` tests; "the fast distance passes give the original order's distances, or refuse exactly the fields not laid out as built"; meshes; scenes | reviewed, benchmarked |
+| (none: the port's own) | `layoutAsBuilt`, whether `buildDistanceField` takes its fast passes on a field | "the fast distance passes give the original order's distances, or refuse exactly the fields not laid out as built" | reviewed |
 | `rcBuildRegions` (watershed) | `buildRegions` | "regions build the same with borders and area limits"; "more regions than 16 bits hold fail the watershed as the original"; meshes; scenes | reviewed, benchmarked |
 | `rcBuildRegionsMonotone` | `buildRegionsMonotone` | "regions build the same with borders and area limits"; edges; meshes; scenes | reviewed, benchmarked |
 | `rcBuildLayerRegions` | `buildLayerRegions` | as above | reviewed, benchmarked |
@@ -124,7 +127,7 @@ instructions.
 
 | upstream | zig-recast | tests | state |
 | --- | --- | --- | --- |
-| `rcBuildContours`, with each combination of its two flags | `buildContours` | "contours and polygons match for every contour flag and vertex limit"; meshes; scenes | reviewed, benchmarked |
+| `rcBuildContours`, with each combination of its two flags | `buildContours` | "contours and polygons match for every contour flag and vertex limit"; "the distance field and contours match on grids broken at every place of a run"; "hand-built fields with regions build contours as the original"; meshes; scenes | reviewed, benchmarked |
 
 ## RecastMesh.cpp
 
