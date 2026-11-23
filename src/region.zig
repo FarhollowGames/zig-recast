@@ -1791,6 +1791,29 @@ fn mergeAndFilterLayerRegions(
     return reg_id_gen;
 }
 
+/// Whether `buildDistanceField` takes its fast passes on `chf` (see
+/// `distances`): whether the spans of the columns that have any follow one
+/// another in the columns' order, and every connection names a span of its
+/// neighbour column inside the field. True for every field that
+/// `buildCompactHeightfield` builds with at most 255 spans a column; a
+/// caller that builds or edits fields itself can check its own with it.
+pub fn layoutAsBuilt(chf: *const CompactHeightfield) bool {
+    const v: DistanceView = .of(chf);
+    var next_span: usize = no_span;
+    for (0..v.height) |y| for (0..v.width) |x| {
+        const col = y * v.width + x;
+        const c = v.cells[col];
+        if (c.count == 0) continue;
+        if (next_span != no_span and c.index != next_span) return false;
+        next_span = @as(usize, c.index) + c.count;
+        const allowed = allowedLayers(v, .of(v, col, true), x, y);
+        for (c.index..@as(usize, c.index) + c.count) |i| {
+            if (connectionsOutside(v.spans[i].con, allowed) != 0) return false;
+        }
+    };
+    return true;
+}
+
 /// Builds `chf.dist`, each span's distance to the nearest border or area
 /// change, blurred, and `chf.max_distance`, the largest before the blur.
 /// `buildRegions` needs it. Replaces an existing distance field.
@@ -2323,4 +2346,116 @@ test "removing repeated neighbours keeps one and wraps around" {
     try reg.connections.appendSlice(gpa, &.{ 4, 4, 4 });
     removeAdjacentNeighbours(&reg);
     try testing.expectEqualSlices(i32, &.{4}, reg.connections.items);
+}
+
+/// A random field for the tests below: `layers` spans a column at most,
+/// with connections that name a span of the neighbour column, or now and
+/// then (`odd` per thousand) one past it, one out of the field's west or
+/// east edge, or a column that shares the spans before it.
+fn testField(gpa: Allocator, random: std.Random, w: usize, h: usize, layers: u8, odd: u32) !CompactHeightfield {
+    const cells = try gpa.alloc(recast.CompactCell, w * h);
+    errdefer gpa.free(cells);
+    var count: usize = 0;
+    for (cells) |*c| {
+        const n = random.uintAtMost(u8, layers);
+        var index = count;
+        if (n > 0 and count > 0 and random.uintLessThan(u32, 1000) < odd) index -= 1;
+        c.* = .{ .index = @intCast(index), .count = n };
+        count = index + n;
+    }
+    const spans = try gpa.alloc(recast.CompactSpan, count + 64);
+    errdefer gpa.free(spans);
+    const areas = try gpa.alloc(u8, count + 64);
+    errdefer gpa.free(areas);
+    for (spans) |*sp| sp.* = .{ .y = 0, .reg = 0, .con = 0xffffff, .h = 0 };
+    for (areas) |*a| a.* = if (random.uintLessThan(u32, 100) < 3) 2 else 1;
+    const steps = [4]isize{ -1, @intCast(w), 1, -@as(isize, @intCast(w)) };
+    for (0..h) |y| for (0..w) |x| {
+        const col = y * w + x;
+        const c = cells[col];
+        for (c.index..@as(usize, c.index) + c.count) |i| {
+            var con: u32 = 0;
+            for (0..4) |d| {
+                var k: u32 = 0x3f;
+                const n_col = @as(isize, @intCast(col)) + steps[d];
+                const inside = switch (d) {
+                    0 => x > 0,
+                    1 => y + 1 < h,
+                    2 => x + 1 < w,
+                    else => y > 0,
+                };
+                const wraps = !inside and (d == 0 or d == 2) and n_col >= 0 and n_col < w * h;
+                if ((inside or (wraps and random.uintLessThan(u32, 1000) < odd)) and random.uintLessThan(u32, 100) < 95) {
+                    const nc = cells[@intCast(n_col)];
+                    if (nc.count > 0) {
+                        k = random.uintLessThan(u32, nc.count);
+                        if (random.uintLessThan(u32, 1000) < odd) k = @min(nc.count + random.uintLessThan(u32, 3), 62);
+                    }
+                }
+                con |= k << @intCast(d * 6);
+            }
+            spans[i].con = @intCast(con);
+        }
+    };
+    return .{
+        .width = @intCast(w),
+        .height = @intCast(h),
+        .span_count = @intCast(count),
+        .walkable_height = 0,
+        .walkable_climb = 0,
+        .border_size = 0,
+        .max_distance = 0,
+        .max_regions = 0,
+        .bmin = @splat(0),
+        .bmax = @splat(0),
+        .cs = 1,
+        .ch = 1,
+        .cells = cells,
+        .spans = spans,
+        .dist = &.{},
+        .areas = areas,
+    };
+}
+
+test "the fast distance passes give the original order's distances, or refuse exactly the fields not laid out as built" {
+    const gpa = std.testing.allocator;
+    var prng: std.Random.DefaultPrng = .init(0xd157);
+    const random = prng.random();
+    const sizes = [_][2]usize{ .{ 1, 1 }, .{ 1, 9 }, .{ 9, 1 }, .{ 3, 3 }, .{ 17, 5 }, .{ 18, 6 }, .{ 35, 20 }, .{ 70, 40 } };
+    var refused: usize = 0;
+    var taken: usize = 0;
+    for (0..300) |round| {
+        const size = sizes[round % sizes.len];
+        const layers: u8 = @intCast(1 + round % 4);
+        const odd: u32 = if (round % 3 == 0) 0 else 4;
+        var chf = try testField(gpa, random, size[0], size[1], layers, odd);
+        defer chf.deinit(gpa);
+        const n: usize = @intCast(chf.span_count);
+        const fast = try gpa.alloc(u16, n);
+        defer gpa.free(fast);
+        const in_order = try gpa.alloc(u16, n);
+        defer gpa.free(in_order);
+        const in_order_max = distancesInOrder(&chf, in_order);
+        if (distances(&chf, fast)) |fast_max| {
+            taken += 1;
+            try std.testing.expect(layoutAsBuilt(&chf));
+            try std.testing.expectEqual(in_order_max, fast_max);
+            try std.testing.expectEqualSlices(u16, in_order, fast);
+        } else {
+            refused += 1;
+            try std.testing.expect(!layoutAsBuilt(&chf));
+        }
+        // The blur, against each column blurred on its own.
+        const blurred = try gpa.alloc(u16, n);
+        defer gpa.free(blurred);
+        const plain = try gpa.alloc(u16, n);
+        defer gpa.free(plain);
+        @memset(blurred, 0);
+        @memset(plain, 0);
+        blur(&chf, in_order, blurred);
+        const v: DistanceView = .of(&chf);
+        for (0..v.columns) |col| blurColumn(v, in_order.ptr, plain.ptr, col, true);
+        try std.testing.expectEqualSlices(u16, plain, blurred);
+    }
+    try std.testing.expect(refused > 20 and taken > 20);
 }

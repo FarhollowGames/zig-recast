@@ -61,6 +61,7 @@ pub const offsetPoly = area.offsetPoly;
 pub const markCylinderArea = area.markCylinderArea;
 
 pub const buildDistanceField = region.buildDistanceField;
+pub const layoutAsBuilt = region.layoutAsBuilt;
 pub const buildRegions = region.buildRegions;
 pub const buildLayerRegions = region.buildLayerRegions;
 pub const buildRegionsMonotone = region.buildRegionsMonotone;
