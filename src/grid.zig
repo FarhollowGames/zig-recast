@@ -1,11 +1,12 @@
 // Part of zig-recast, a translation of Recast from recastnavigation 1.6.0
 // to Zig; zlib licence, see LICENSE.
 
-//! Runs of columns of a compact heightfield that form a plain grid, where
-//! the passes over the whole field (the distance field, its blur and the
-//! contours' boundaries) can take 16 spans at a time: in such a run every
-//! neighbour of a span is the span of the neighbouring column, at a fixed
-//! step in `spans` from it.
+//! Runs of columns of a compact heightfield that form a plain grid, one,
+//! two or four floors deep, where the passes over the whole field (the
+//! distance field, its blur and the contours' boundaries) can take 16
+//! spans at a time: in such a run every neighbour of a span is the span of
+//! the same floor of the neighbouring column, at a fixed step in `spans`
+//! from it.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -17,60 +18,104 @@ const CompactSpan = recast.CompactSpan;
 /// Columns a run takes: 16 lanes of 32 bits, one AVX-512 register.
 pub const run_len = 16;
 
+/// The most spans a column of a run may hold.
+pub const max_layers = 4;
+
 /// A run of `run_len` columns in a row whose columns, and the columns
 /// around them from one before it to one after it in the rows below, at
-/// and above it, each hold one span, connected to the span of the column
-/// next to it on every side, and whose rows' spans follow one another.
-/// `below`, `at` and `above` are the spans of the run's first column and of
-/// the columns below and above it.
+/// and above it, each hold the same number of spans, `layers` (1, 2 or 4),
+/// at consecutive indices along each row, and whose every span is
+/// connected on every side to the span of the same layer of the
+/// neighbouring column. There a span's neighbour west or east is `layers`
+/// spans from it, and the spans of a row's run follow one another, so a
+/// run's spans are `layers` vectors of `run_len` spans. `below`, `at` and
+/// `above` are the first spans of the run's first column and of the
+/// columns below and above it.
 pub const Run = struct {
     below: usize,
     at: usize,
     above: usize,
+    layers: usize,
 
     /// The run from column `col` of a field `width` columns wide, or null
     /// where its columns are not as `Run` needs. `col` must be at least a
     /// row and a column from every edge of the field, and `run_len` columns
     /// and one more from the east one, as `RowRuns` puts it.
     pub fn of(cells: [*]const CompactCell, spans: [*]const CompactSpan, width: usize, col: usize) ?Run {
-        const below = row(cells, spans, col - width) orelse return null;
         const at = row(cells, spans, col) orelse return null;
+        const below = row(cells, spans, col - width) orelse return null;
         const above = row(cells, spans, col + width) orelse return null;
-        return .{ .below = below, .at = at, .above = above };
+        if (below.layers != at.layers or above.layers != at.layers) return null;
+        return .{ .below = below.at, .at = at.at, .above = above.at, .layers = at.layers };
     }
 
-    /// The span of column `col` if columns `col` - 1 to `col` + `run_len`
-    /// each hold one span, with connections of index 0 on every side, at
-    /// consecutive indices; null otherwise. `col` must be at least a column
+    /// One row of a run: the first span of column `col` and the spans a
+    /// column.
+    pub const Row = struct { at: usize, layers: usize };
+
+    /// The row of a run from column `col` if columns `col` - 1 to `col` +
+    /// `run_len` each hold the same number of spans, 1, 2 or 4, following
+    /// one another, each connected on every side to the same layer of the
+    /// neighbouring column; null otherwise. `col` must be at least a column
     /// from the start of `cells` and `run_len` columns and one more from its
     /// end.
-    pub fn row(cells: [*]const CompactCell, spans: [*]const CompactSpan, col: usize) ?usize {
+    pub fn row(cells: [*]const CompactCell, spans: [*]const CompactSpan, col: usize) ?Row {
+        const words: [*]const u32 = @ptrCast(cells);
+        const layers = words[col - 1] >> 24;
+        // One floor inline; two or four out of line, so that their checks
+        // do not crowd the loops that call this.
+        if (layers == 1) return rowOf(cells, spans, col, 1);
+        if (layers != 2 and layers != 4) return null;
+        return @call(.never_inline, rowDeeper, .{ cells, spans, col, layers });
+    }
+
+    fn rowDeeper(cells: [*]const CompactCell, spans: [*]const CompactSpan, col: usize, layers: u32) ?Row {
+        return switch (layers) {
+            inline 2, 4 => |l| rowOf(cells, spans, col, l),
+            else => null,
+        };
+    }
+
+    inline fn rowOf(cells: [*]const CompactCell, spans: [*]const CompactSpan, col: usize, comptime layers: u32) ?Row {
         const Words = @Vector(run_len, u32);
         const words: [*]const u32 = @ptrCast(cells);
         const first = words[col - 1];
-        // One span, and an index that the run's last does not carry past
-        // the 24 bits of `index` into `count`.
-        if (first >> 24 != 1 or (first & 0xffffff) + run_len + 1 > 0xffffff) return null;
-        const want: Words = @as(Words, @splat(first)) + std.simd.iota(u32, run_len);
+        // An index that the run's last does not carry past the 24 bits of
+        // `index` into `count`.
+        const span_first: usize = first & 0xffffff;
+        const span_count = (run_len + 2) * layers;
+        if (span_first + span_count > 0xffffff) return null;
+        const step = comptime std.simd.iota(u32, run_len) * @as(Words, @splat(layers));
+        const want: Words = @as(Words, @splat(first)) + step;
         const lo: Words = words[col - 1 ..][0..run_len].*;
         const hi: Words = words[col + 1 ..][0..run_len].*;
-        if (@reduce(.Or, lo != want) or @reduce(.Or, hi != want + @as(Words, @splat(2)))) return null;
-        // Every connection 0: all 24 bits of `con` clear.
-        const span_first: usize = first & 0xffffff;
+        if (@reduce(.Or, lo != want) or @reduce(.Or, hi != want + @as(Words, @splat(2 * layers)))) return null;
+        // Each span's four connections its layer: 0, 1, 2 or 3 in each
+        // field.
         const Spans = @Vector(run_len, u64);
         const span_words: [*]const u64 = @ptrCast(spans);
         const con_mask: Spans = @splat(@as(u64, 0xffffff) << 32);
-        const s_lo: Spans = span_words[span_first..][0..run_len].*;
-        const s_hi: Spans = span_words[span_first + 2 ..][0..run_len].*;
-        if (@reduce(.Or, (s_lo | s_hi) & con_mask) != 0) return null;
-        return span_first + 1;
+        const chunks = comptime (span_count + run_len - 1) / run_len;
+        inline for (0..chunks) |c| {
+            const o = comptime @min(c * run_len, span_count - run_len);
+            const expected = comptime blk: {
+                var e: [run_len]u64 = undefined;
+                for (&e, 0..) |*x, k| x.* = (@as(u64, (o + k) % layers) * 0x041041) << 32;
+                break :blk e;
+            };
+            const got: Spans = span_words[span_first + o ..][0..run_len].*;
+            if (@reduce(.Or, (got & con_mask) != @as(Spans, expected))) return null;
+        }
+        return .{ .at = span_first + layers, .layers = layers };
     }
 };
 
-comptime {
-    // `Run.row` reads the cells and spans as words.
-    assert(@bitSizeOf(CompactCell) == 32 and @bitOffsetOf(CompactCell, "count") == 24);
-    assert(@bitSizeOf(CompactSpan) == 64 and @bitOffsetOf(CompactSpan, "con") == 32);
+/// Whether the `run_len` columns from `col` hold no spans.
+pub inline fn emptyBlock(cells: [*]const CompactCell, col: usize) bool {
+    const Words = @Vector(run_len, u32);
+    const words: [*]const u32 = @ptrCast(cells);
+    const block: Words = words[col..][0..run_len].*;
+    return @reduce(.Or, block >> @splat(24)) == 0;
 }
 
 /// The region ids of the `run_len` spans from `i`.

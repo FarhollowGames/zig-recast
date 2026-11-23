@@ -806,19 +806,41 @@ inline fn markBoundaries(
     }
 }
 
+/// Whether every span of a run's row has every edge or none on the
+/// boundary, and if so sets their flags to 0.
+inline fn skipRun(flags: [*]u8, run_row: Run.Row) bool {
+    const Flags = @Vector(run_len, u8);
+    const zero: Flags = @splat(0);
+    const all: Flags = @splat(0xf);
+    const n = run_len * run_row.layers;
+    var i = run_row.at;
+    while (i < run_row.at + n) : (i += run_len) {
+        const f: Flags = flags[i..][0..run_len].*;
+        if (!@reduce(.And, (f == zero) | (f == all))) return false;
+    }
+    @memset(flags[run_row.at..][0..n], 0);
+    return true;
+}
+
 /// `markBoundaries` over a run of a grid's columns.
 inline fn markRunBoundaries(spans: [*]const recast.CompactSpan, flags: [*]u8, run: Run) void {
-    const Regs = @Vector(run_len, u16);
-    const Flags = @Vector(run_len, u8);
-    const reg = grid.regions(spans, run.at);
-    const one: Flags = @splat(1);
-    const zero: Flags = @splat(0);
-    var res = @select(u8, grid.regions(spans, run.at - 1) == reg, one, zero);
-    res |= @select(u8, grid.regions(spans, run.above) == reg, one << @splat(1), zero);
-    res |= @select(u8, grid.regions(spans, run.at + 1) == reg, one << @splat(2), zero);
-    res |= @select(u8, grid.regions(spans, run.below) == reg, one << @splat(3), zero);
-    const none = (reg == @as(Regs, @splat(0))) | (reg & @as(Regs, @splat(border_reg)) != @as(Regs, @splat(0)));
-    flags[run.at..][0..run_len].* = @select(u8, none, zero, res ^ @as(Flags, @splat(0xf)));
+    switch (run.layers) {
+        inline 1, 2, 4 => |layers| inline for (0..layers) |part| {
+            const at = run.at + part * run_len;
+            const Regs = @Vector(run_len, u16);
+            const Flags = @Vector(run_len, u8);
+            const reg = grid.regions(spans, at);
+            const one: Flags = @splat(1);
+            const zero: Flags = @splat(0);
+            var res = @select(u8, grid.regions(spans, at - layers) == reg, one, zero);
+            res |= @select(u8, grid.regions(spans, run.above + part * run_len) == reg, one << @splat(1), zero);
+            res |= @select(u8, grid.regions(spans, at + layers) == reg, one << @splat(2), zero);
+            res |= @select(u8, grid.regions(spans, run.below + part * run_len) == reg, one << @splat(3), zero);
+            const none = (reg == @as(Regs, @splat(0))) | (reg & @as(Regs, @splat(border_reg)) != @as(Regs, @splat(0)));
+            flags[at..][0..run_len].* = @select(u8, none, zero, res ^ @as(Flags, @splat(0xf)));
+        },
+        else => unreachable,
+    }
 }
 
 /// Traces the outline of every region of `chf` (built with its regions) and
@@ -888,7 +910,7 @@ pub fn buildContours(
         while (col < runs.end) : (col += run_len) {
             if (Run.of(cells, spans, wu, col)) |run| {
                 markRunBoundaries(spans, flags.ptr, run);
-            } else {
+            } else if (!grid.emptyBlock(cells, col)) {
                 for (col..col + run_len) |c| markBoundaries(cells, spans, flags.ptr, wu, c);
             }
         }
@@ -908,18 +930,23 @@ pub fn buildContours(
     while (y < h) : (y += 1) {
         const runs: RowRuns = .of(wu, hu, @intCast(y));
         const runs_end: i32 = @intCast(runs.end - runs.first);
+        // The next column that starts a block of `run_len`, from column 1.
+        var block: i32 = 1;
         var x: i32 = 0;
         while (x < w) : (x += 1) {
-            // A run of a grid's columns whose spans all have every edge
-            // or none on the boundary starts no contour, and its flags go
-            // to 0 as the loop below would set them.
-            if (x >= 1 and x <= runs_end and @rem(x - 1, run_len) == 0) {
-                if (Run.row(cells, spans, @intCast(x + y * w))) |at| {
-                    const Flags = @Vector(run_len, u8);
-                    const run_flags: Flags = flags[at..][0..run_len].*;
-                    const zero: Flags = @splat(0);
-                    if (@reduce(.And, (run_flags == zero) | (run_flags == @as(Flags, @splat(0xf))))) {
-                        flags[at..][0..run_len].* = zero;
+            if (x == block and x <= runs_end) {
+                block += run_len;
+                const col: usize = @intCast(x + y * w);
+                // A block with no spans has nothing to walk; a run of a
+                // grid's columns whose spans all have every edge or none
+                // on the boundary starts no contour, and its flags go to
+                // 0 as the loop below would set them.
+                if (grid.emptyBlock(cells, col)) {
+                    x += run_len - 1;
+                    continue;
+                }
+                if (Run.row(cells, spans, col)) |run_row| {
+                    if (skipRun(flags.ptr, run_row)) {
                         x += run_len - 1;
                         continue;
                     }

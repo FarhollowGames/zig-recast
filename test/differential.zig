@@ -1333,7 +1333,8 @@ test "the distance field and contours match on grids broken at every place of a 
     // a second floor above, columns with only that floor (whose
     // neighbours join index 1), steps too high to climb and other areas,
     // at densities from none to most columns; and fields narrower,
-    // shorter and a column or two wider than a run. Then the regions, with
+    // shorter and a column or two wider than a run; with one, two or four
+    // floors in every column, one above the other. Then the regions, with
     // and without a border, and their contours.
     var prng: std.Random.DefaultPrng = .init(17);
     const random = prng.random();
@@ -1346,7 +1347,7 @@ test "the distance field and contours match on grids broken at every place of a 
         .{ 100, 1 }, .{ 3, 100 }, .{ 130, 70 },
     };
     const densities = [_]u32{ 0, 1, 10, 100, 400, 1000 };
-    for (sizes) |size| for (densities) |per_thousand| for (0..2) |round| {
+    for ([_]usize{ 1, 2, 4 }) |layers| for (sizes) |size| for (densities) |per_thousand| for (0..2) |round| {
         const w = size[0];
         const h = size[1];
         const bmin: [3]f32 = .{ 0, 0, 0 };
@@ -1360,13 +1361,18 @@ test "the distance field and contours match on grids broken at every place of a 
         while (z < h) : (z += 1) {
             var x: i32 = 0;
             while (x < w) : (x += 1) {
-                var floors: [2]?u16 = .{ 10, null };
+                // Floors 150 apart from 10, and one more above them.
+                var floors: [5]?u16 = @splat(null);
+                for (0..layers) |k| floors[k] = @intCast(10 + 150 * k);
                 var area: u8 = recast.walkable_area;
                 if (random.uintLessThan(u32, 1000) < per_thousand) {
                     switch (random.uintLessThan(u32, 5)) {
-                        0 => floors = .{ null, null },
-                        1 => floors[1] = 200,
-                        2 => floors = .{ null, 200 },
+                        0 => floors[random.uintLessThan(usize, layers)] = null,
+                        1 => floors[4] = 900,
+                        2 => {
+                            floors = @splat(null);
+                            floors[4] = 900;
+                        },
                         3 => floors[0] = 30,
                         else => area = 1 + random.uintLessThan(u8, 2),
                     }

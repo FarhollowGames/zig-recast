@@ -338,3 +338,97 @@ test "hand-built grids of many shapes build the distance field and regions as th
     };
     try testing.expectEqual(0, bad);
 }
+
+/// A field of one span a column whose connections also leave a row's west
+/// or east edge, `wrap` per thousand of them, into the row before or after,
+/// which the original follows to cells inside the field; `area2` per
+/// thousand spans of another area.
+fn genWrap(random: std.Random, w: i32, h: i32, wrap_per_thousand: u32, area2: u32) !Field {
+    const wu: usize = @intCast(w);
+    const hu: usize = @intCast(h);
+    const n = wu * hu;
+    const cells = try gpa.alloc(recast.CompactCell, n);
+    const spans = try gpa.alloc(recast.CompactSpan, n);
+    const areas = try gpa.alloc(u8, n);
+    for (cells, 0..) |*c, i| c.* = .{ .index = @intCast(i), .count = 1 };
+    for (areas) |*a| a.* = if (random.uintLessThan(u32, 1000) < area2) 2 else 1;
+    const dx = [4]i32{ -1, 0, 1, 0 };
+    const dy = [4]i32{ 0, 1, 0, -1 };
+    const steps = [4]isize{ -1, w, 1, -w };
+    for (0..hu) |y| for (0..wu) |x| {
+        const i = x + y * wu;
+        var con: u24 = 0;
+        for (0..4) |d| {
+            var v: u24 = 0x3f;
+            const nx = @as(i32, @intCast(x)) + dx[d];
+            const ny = @as(i32, @intCast(y)) + dy[d];
+            const inside = nx >= 0 and ny >= 0 and nx < w and ny < h;
+            const ncol = @as(isize, @intCast(i)) + steps[d];
+            const wraps = !inside and ny >= 0 and ny < h and ncol >= 0 and ncol < @as(isize, @intCast(n));
+            if (inside or (wraps and random.uintLessThan(u32, 1000) < wrap_per_thousand)) v = 0;
+            con |= v << @intCast(d * 6);
+        }
+        spans[i] = .{ .y = 0, .reg = 0, .con = con, .h = 0 };
+    };
+    return .{ .w = w, .h = h, .cells = cells, .spans = spans, .areas = areas };
+}
+
+test "connections out of a row's west or east edge build the distance field as the original" {
+    var prng: std.Random.DefaultPrng = .init(77);
+    const random = prng.random();
+    const sizes = [_][2]i32{ .{ 1, 6 }, .{ 2, 8 }, .{ 3, 8 }, .{ 4, 10 }, .{ 7, 12 }, .{ 20, 20 }, .{ 40, 40 } };
+    var bad: usize = 0;
+    for (sizes) |s| for (0..60) |round| {
+        const f = try genWrap(random, s[0], s[1], if (round % 2 == 0) 1000 else 500, if (round % 3 == 0) 0 else 30);
+        defer freeField(f);
+        if (!try check(f, false)) bad += 1;
+    };
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "a grid whose rows join end to end builds the distance field and regions as the original" {
+    // Each row's last column joined east to the next row's first, and each
+    // row's first column west to the row before's last.
+    for ([_][2]usize{ .{ 3, 12 }, .{ 4, 12 }, .{ 8, 14 }, .{ 30, 30 } }) |size| {
+        const w = size[0];
+        const h = size[1];
+        var order: [30 * 30]usize = undefined;
+        for (order[0 .. w * h], 0..) |*o, i| o.* = i;
+        const f = try plainGrid(w, h, order[0 .. w * h]);
+        defer freeField(f);
+        for (0..h) |y| {
+            if (y > 0) f.spans[y * w].con &= ~@as(u24, 0x3f << 0);
+            if (y + 1 < h) f.spans[y * w + w - 1].con &= ~@as(u24, 0x3f << 12);
+        }
+        try testing.expect(try check(f, true));
+    }
+}
+
+test "a field whose spans start past unused ones builds the distance field as the original" {
+    // Every column's spans one further on, after an unused span 0: still in
+    // the columns' order, so the fast passes apply.
+    for ([_][2]usize{ .{ 7, 7 }, .{ 40, 30 } }) |size| {
+        const w = size[0];
+        const h = size[1];
+        var order: [40 * 30]usize = undefined;
+        for (order[0 .. w * h], 0..) |*o, i| o.* = i;
+        const g = try plainGrid(w, h, order[0 .. w * h]);
+        defer freeField(g);
+        const n = w * h + 1;
+        const f: Field = .{
+            .w = g.w,
+            .h = g.h,
+            .cells = try gpa.dupe(recast.CompactCell, g.cells),
+            .spans = try gpa.alloc(recast.CompactSpan, n),
+            .areas = try gpa.alloc(u8, n),
+        };
+        defer freeField(f);
+        for (f.cells) |*c| c.index += 1;
+        f.spans[0] = .{ .y = 0, .reg = 0, .con = 0xffffff, .h = 0 };
+        f.areas[0] = 0;
+        @memcpy(f.spans[1..], g.spans);
+        @memcpy(f.areas[1..], g.areas);
+        f.areas[1 + n / 2] = 2;
+        try testing.expect(try check(f, true));
+    }
+}
