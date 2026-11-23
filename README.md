@@ -35,10 +35,10 @@ dependencies beyond the standard library. The original is listed under
 ## Install
 
 ```sh
-zig fetch --save git+https://github.com/farhollowgames/zig-recast#v0.1.1
+zig fetch --save git+https://github.com/farhollowgames/zig-recast#v0.1.4
 ```
 
-`v0.1.1` is the latest release. The package needs Zig 0.17.0.
+`v0.1.4` is the latest release. The package needs Zig 0.17.0.
 
 In `build.zig`:
 
@@ -190,11 +190,12 @@ place, are listed in [`STATUS.md`](STATUS.md#left-out). In short:
 
 ## Tests
 
-`zig build test` runs 81 tests. 56 run the original beside the port on the
+`zig build test` runs 95 tests. 68 run the original beside the port on the
 same inputs and compare their results: the structures each step builds,
 byte for byte, and every log message, timer call and returned value. The
-other 25 test the port alone. The inputs are RecastDemo's meshes, generated
-terrains, hand-made edge cases, upstream's own tests and seeded fuzzing.
+other 27 test the port alone. The inputs are RecastDemo's meshes, generated
+terrains, hand-made edge cases and fields, upstream's own tests and seeded
+fuzzing.
 
 - [`doc/TESTING.md`](doc/TESTING.md): how the tests compare the port with
   the original, and what this repository's tests cover.
@@ -204,23 +205,29 @@ terrains, hand-made edge cases, upstream's own tests and seeded fuzzing.
 ## Speed
 
 Port time against original time, one core, the lowest and the highest over
-seven inputs from RecastDemo's meshes to a 1 km tiled terrain:
+eleven inputs from RecastDemo's meshes to a 1 km tiled terrain, two storeys
+and a field of posts:
 
 | feature | time, port / original | port vs original |
 | --- | ---: | ---: |
-| Whole build | 0.38 to 0.92 | 62% to 8% faster |
-| Rasterization, int indices | 0.90 to 0.96 | 10% to 4% faster |
-| Distance field | 1.09 to 1.30 | 9% to 30% slower |
-| Watershed regions | 0.58 to 0.93 | 42% to 7% faster |
-| Detail mesh | 0.09 to 0.76 | 91% to 24% faster |
+| Whole build | 0.41 to 0.92 | 59% to 8% faster |
+| Rasterization, int indices | 0.83 to 0.92 | 17% to 8% faster |
+| Distance field | 0.32 to 0.96 | 68% to 4% faster |
+| Watershed regions | 0.72 to 0.86 | 28% to 14% faster |
+| Contours | 0.47 to 0.93 | 53% to 7% faster |
+| Detail mesh | 0.15 to 0.95 | 85% to 5% faster |
 
-The distance field is the slowest feature, the larger the field the slower.
-Grid size (1.17 to 1.19) and a few small steps are also slower on some
-inputs, up to 12%.
+The distance field and the contours were the slowest features at 0.1.3;
+where the columns form a plain grid, one, two or four floors deep, they
+now take 16 spans at a time. The ledge filter (1.03 to 1.50), the polygon
+mesh on the rolling ground (1.24 and 1.36) and a few small steps are
+slower on some inputs on this machine; their code is as it was at 0.1.3.
 
-AMD Ryzen 9 9950X3D, one core, Linux 7.3.3, Zig 0.17.0 ReleaseFast against
-clang 22.1.8 `-O3`, at commit `c14a021`; each figure the median of 7 runs; a
-load average of at most 3.0 on 32 hardware threads.
+A cloud virtual machine with an Intel Xeon (`graniterapids`), one core,
+Linux 6.18.44, Zig 0.17.0 ReleaseFast against clang 22.1.8 `-O3`, at commit
+`1c7f8b0`; each figure the median of 7 runs, the row from the median of
+three benchmark runs. Earlier figures, from an AMD Ryzen 9 9950X3D, are not
+comparable with these.
 
 - [`doc/BENCHMARKS.md`](doc/BENCHMARKS.md): every feature's table, the
   flags on both sides, the biases and the command.

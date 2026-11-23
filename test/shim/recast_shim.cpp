@@ -750,4 +750,29 @@ int shim_chf_most_row_sweeps(void* chf_ptr, int border, int same_area) {
     return most;
 }
 
+// Replaces a compact heightfield's columns, spans and areas with copies of
+// the given ones, for fields built by hand.
+void shim_chf_replace(void* chf_ptr, int w, int h, int span_count, const unsigned* cells,
+                      const unsigned long long* spans, const unsigned char* areas) {
+    rcCompactHeightfield* chf = (rcCompactHeightfield*)chf_ptr;
+    rcFree(chf->cells);
+    rcFree(chf->spans);
+    rcFree(chf->areas);
+    rcFree(chf->dist);
+    chf->dist = 0;
+    chf->width = w;
+    chf->height = h;
+    chf->spanCount = span_count;
+    chf->cells = (rcCompactCell*)rcAlloc(sizeof(rcCompactCell) * (w * h > 0 ? w * h : 1), RC_ALLOC_PERM);
+    chf->spans = (rcCompactSpan*)rcAlloc(sizeof(rcCompactSpan) * (span_count > 0 ? span_count : 1), RC_ALLOC_PERM);
+    chf->areas = (unsigned char*)rcAlloc(span_count > 0 ? span_count : 1, RC_ALLOC_PERM);
+    memcpy(chf->cells, cells, sizeof(rcCompactCell) * w * h);
+    memcpy(chf->spans, spans, sizeof(rcCompactSpan) * span_count);
+    memcpy(chf->areas, areas, span_count);
+}
+
+void shim_chf_set_max_regions(void* chf_ptr, int max_regions) {
+    ((rcCompactHeightfield*)chf_ptr)->maxRegions = (unsigned short)max_regions;
+}
+
 } // extern "C"
